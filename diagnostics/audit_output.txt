@@ -1,0 +1,62 @@
+==============================================================================
+PART 1  Derivation length per version field
+==============================================================================
+version=1 -> hmac_key_size param = 20 BITS(=20!); bytes requested from RFC7292 KDF = 2
+version=2 -> hmac_key_size param = 160 bits; bytes requested from RFC7292 KDF = 20
+
+==============================================================================
+PART 2  Independent HMAC verification over shipped test stores
+==============================================================================
+empty.bksv1                      v1 key= 2 bytes key_hex=41e9 HMAC MATCH
+empty.bksv2                      v2 key=20 bytes key_hex=81d453454dfd70b420f4d093cf3a620b4e19f4e8 HMAC MATCH
+christmas.bksv1                  v1 key= 2 bytes key_hex=dd9f HMAC MATCH
+christmas.bksv2                  v2 key=20 bytes key_hex=d2b1341c477f611b0fc4f344ea6a1bd5f74e2c07 HMAC MATCH
+custom_entry_passwords.bksv1     v1 key= 2 bytes key_hex=dff2 HMAC MATCH
+custom_entry_passwords.bksv2     v2 key=20 bytes key_hex=3ddf6ee4138bb344bdc23582ef192bb8ebef15a9 HMAC MATCH
+
+==============================================================================
+PART 3  HMAC coverage: what bytes are / are not authenticated
+==============================================================================
+file length            : 2070
+header (version+salt+iter), bytes 0..31 : NOT covered by HMAC
+entry region covered   : bytes 32..2049 (2018 bytes)
+stored HMAC tail       : bytes 2050..2069 (20 bytes SHA-1)
+proof: flip 1 salt byte (header, outside HMAC region), tail untouched
+  (a) MAC over unchanged entry region with ORIGINAL derived key: MATCH
+  (b) MAC re-derived from MODIFIED salt (what a real parser uses): mismatch -> tampering detected only because the KDF input changed
+
+==============================================================================
+PART 4  Required anomaly scenarios
+==============================================================================
+
+[4a] version field rewritten (christmas v1/v2, correct password)
+  christmas.bksv1 version 1->2 : KeystoreSignatureException: Hash mismatch; incorrect keystore password?
+  christmas.bksv1 version 1->3 : UnsupportedKeystoreVersionException: Unsupported BKS keystore version; only V1 and V2 supported, found v3
+  christmas.bksv2 version 2->1 : KeystoreSignatureException: Hash mismatch; incorrect keystore password?
+  christmas.bksv2 version 2->3 : UnsupportedKeystoreVersionException: Unsupported BKS keystore version; only V1 and V2 supported, found v3
+
+[4b] empty stores (public test password "")
+  empty.bksv1: entry region length = 1 (single 0x00 terminator=True)
+    loads() OK -> type=bks version=1 entries=0
+  empty.bksv2: entry region length = 1 (single 0x00 terminator=True)
+    loads() OK -> type=bks version=2 entries=0
+
+[4c] correct password, MAC tail corrupted by one bit
+  christmas.bksv1                  KeystoreSignatureException: Hash mismatch; incorrect keystore password? | parseable entries before MAC gate = 6
+  christmas.bksv2                  KeystoreSignatureException: Hash mismatch; incorrect keystore password? | parseable entries before MAC gate = 6
+  empty.bksv1                      KeystoreSignatureException: Hash mismatch; incorrect keystore password? | parseable entries before MAC gate = 0
+  empty.bksv2                      KeystoreSignatureException: Hash mismatch; incorrect keystore password? | parseable entries before MAC gate = 0
+
+[4d] wrong password (public test material only)
+  christmas.bksv1                  KeystoreSignatureException: Hash mismatch; incorrect keystore password?
+  christmas.bksv2                  KeystoreSignatureException: Hash mismatch; incorrect keystore password?
+
+==============================================================================
+PART 5  v1 key-space exhaustion (offline, on test material only)
+==============================================================================
+store              : empty.bksv1
+candidates tried   : 65536 (2-byte space)
+key recovered w/o password : 41e9
+key derived from password   : 41e9 (length 2)
+identical          : True
+v2 store hit within same 65536 2-byte attempts: False (v2 key is 20 bytes = 160-bit space)
