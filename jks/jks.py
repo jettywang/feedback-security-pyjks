@@ -32,6 +32,7 @@ import hashlib
 import javaobj
 import time
 from pyasn1.codec.ber import encoder, decoder
+from pyasn1.error import PyAsn1Error
 from pyasn1_modules import rfc5208
 from pyasn1_modules.rfc2459 import AlgorithmIdentifier
 from pyasn1.type import univ, namedtype
@@ -293,6 +294,8 @@ class SecretKeyEntry(AbstractKeystoreEntry):
                                  of the ASCII character set.
         :raises DecryptionFailureException: If the entry could not be decrypted using the given password.
         :raises UnexpectedAlgorithmException: If the entry was encrypted with an unknown or unexpected algorithm
+        :raises UnexpectedJavaTypeException: If the decrypted object is not a supported secret key representation
+        :raises UnexpectedKeyEncodingException: If a KeyRep object uses an unsupported key encoding
         :raise ValueError: If the password contains non-ASCII characters.
         """
         if self.is_decrypted():
@@ -300,28 +303,41 @@ class SecretKeyEntry(AbstractKeystoreEntry):
 
         plaintext = None
         sealed_obj = self._encrypted
+        seal_alg = getattr(sealed_obj, "sealAlg", None)
+        params_alg = getattr(sealed_obj, "paramsAlg", None)
         #In python 2.7.x many issues have occured where comparison between 'JavaString' & 'str' have failed.
         #https://github.com/kurtbrose/pyjks/issues/60, https://github.com/kurtbrose/pyjks/issues/47
         #type cast sealed_obj.sealAlg which is of type <class 'javaobj.v1.beans.JavaString'> to <type 'str'>
         #So, that 'String' to 'String' comparison is performed and not 'JavaString' to 'String'
-        if str(sealed_obj.sealAlg) == "PBEWithMD5AndTripleDES":  
+        if str(seal_alg) == "PBEWithMD5AndTripleDES":
             # if the object was sealed with PBEWithMD5AndTripleDES
             # then the parameters should apply to the same algorithm
             # and not be empty or null
-            if sealed_obj.paramsAlg != sealed_obj.sealAlg:
-                raise UnexpectedAlgorithmException("Unexpected parameters algorithm used in SealedObject; should match sealing algorithm '%s' but found '%s'" % (sealed_obj.sealAlg, sealed_obj.paramsAlg))
-            if sealed_obj.encodedParams is None or len(sealed_obj.encodedParams) == 0:
-                raise UnexpectedJavaTypeException("No parameters found in SealedObject instance for sealing algorithm '%s'; need at least a salt and iteration count to decrypt" % sealed_obj.sealAlg)
+            if params_alg != seal_alg:
+                raise UnexpectedAlgorithmException("Unexpected parameters algorithm used in SealedObject; should match sealing algorithm '%s' but found '%s'" % (seal_alg, params_alg))
+            encoded_params = getattr(sealed_obj, "encodedParams", None)
+            if encoded_params is None or len(encoded_params) == 0:
+                raise UnexpectedJavaTypeException("No parameters found in SealedObject instance for sealing algorithm '%s'; need at least a salt and iteration count to decrypt" % seal_alg)
 
-            params_asn1 = decoder.decode(sealed_obj.encodedParams, asn1Spec=rfc2898.PBEParameter())[0]
-            salt = params_asn1['salt'].asOctets()
-            iteration_count = int(params_asn1['iterationCount'])
             try:
-                plaintext = sun_crypto.jce_pbe_decrypt(sealed_obj.encryptedContent, key_password, salt, iteration_count)
+                params_asn1 = decoder.decode(encoded_params, asn1Spec=rfc2898.PBEParameter())[0]
+                salt = params_asn1['salt'].asOctets()
+                iteration_count = int(params_asn1['iterationCount'])
+            except (KeyError, TypeError, ValueError, PyAsn1Error):
+                raise UnexpectedJavaTypeException("Malformed PBE parameters in SealedObject instance for secret key '%s'" % self.alias)
+            if len(salt) != 8 or iteration_count < 1:
+                raise UnexpectedJavaTypeException("Invalid PBE salt or iteration count in SealedObject instance for secret key '%s'" % self.alias)
+            encrypted_content = getattr(sealed_obj, "encryptedContent", None)
+            if encrypted_content is None or len(encrypted_content) == 0:
+                raise UnexpectedJavaTypeException("No encrypted content found in SealedObject instance for secret key '%s'" % self.alias)
+            if len(encrypted_content) % 8 != 0:
+                raise UnexpectedJavaTypeException("Encrypted content length in SealedObject instance for secret key '%s' is not a multiple of the cipher block size" % self.alias)
+            try:
+                plaintext = sun_crypto.jce_pbe_decrypt(encrypted_content, key_password, salt, iteration_count)
             except sun_crypto.BadPaddingException:
                 raise DecryptionFailureException("Failed to decrypt data for secret key '%s'; bad password?" % self.alias)
         else:
-            raise UnexpectedAlgorithmException("Unexpected algorithm used for encrypting SealedObject: sealAlg=%s" % sealed_obj.sealAlg)
+            raise UnexpectedAlgorithmException("Unexpected algorithm used for encrypting SealedObject: sealAlg=%s" % seal_alg)
 
         # The plaintext here is another serialized Java object; this
         # time it's an object implementing the javax.crypto.SecretKey
@@ -338,16 +354,21 @@ class SecretKeyEntry(AbstractKeystoreEntry):
         # Again for SunJCE, the subsitute object that gets serialized
         # is usually a java.security.KeyRep object.
         obj, dummy = KeyStore._read_java_obj(plaintext, 0)
-        clazz = obj.get_class()
+        clazz = KeyStore._java_class_of(obj)
         if clazz.name == "javax.crypto.spec.SecretKeySpec":
-            algorithm = obj.algorithm
-            key = KeyStore._java_bytestring(obj.key)
+            KeyStore._java_require_direct_class(clazz)
+            algorithm = KeyStore._java_string_field(obj, "algorithm", clazz.name)
+            key = KeyStore._java_bytes_field(obj, "key", clazz.name)
+            KeyStore._check_secret_key_material(algorithm, key, clazz.name, self.alias)
             key_size = len(key)*8
 
         elif clazz.name == "java.security.KeyRep":
-            assert (obj.type.constant == "SECRET"), "Expected value 'SECRET' for KeyRep.type enum value, found '%s'" % obj.type.constant
-            key_bytes = KeyStore._java_bytestring(obj.encoded)
-            key_encoding = obj.format
+            KeyStore._java_require_direct_class(clazz)
+            type_name = KeyStore._java_enum_constant(obj, "type", "java.security.KeyRep$Type")
+            if type_name != "SECRET":
+                raise UnexpectedJavaTypeException("Expected value 'SECRET' for KeyRep.type enum value, found '%s'" % type_name)
+            key_bytes = KeyStore._java_bytes_field(obj, "encoded", clazz.name)
+            key_encoding = KeyStore._java_string_field(obj, "format", clazz.name)
             if key_encoding == "RAW":
                 pass # ok, no further processing needed
             elif key_encoding == "X.509":
@@ -357,7 +378,8 @@ class SecretKeyEntry(AbstractKeystoreEntry):
             else:
                 raise UnexpectedKeyEncodingException("Unexpected key encoding '%s' found in serialized java.security.KeyRep object; expected one of 'RAW', 'X.509', 'PKCS#8'." % key_encoding)
 
-            algorithm = obj.algorithm
+            algorithm = KeyStore._java_string_field(obj, "algorithm", clazz.name)
+            KeyStore._check_secret_key_material(algorithm, key_bytes, clazz.name, self.alias)
             key = key_bytes
             key_size = len(key)*8
         else:
@@ -716,12 +738,16 @@ class KeyStore(AbstractKeystore):
 
         sealed_obj, pos = cls._read_java_obj(data, pos, ignore_remaining_data=True)
         if not cls._java_is_subclass(sealed_obj, "javax.crypto.SealedObject"):
-            raise UnexpectedJavaTypeException("Unexpected sealed object type '%s'; not a subclass of javax.crypto.SealedObject" % sealed_obj.get_class().name)
+            raise UnexpectedJavaTypeException("Unexpected sealed object type '%s'; not a subclass of javax.crypto.SealedObject" % cls._java_class_of(sealed_obj).name)
 
-        if sealed_obj.encryptedContent:
-            sealed_obj.encryptedContent = cls._java_bytestring(sealed_obj.encryptedContent)
-        if sealed_obj.encodedParams:
-            sealed_obj.encodedParams = KeyStore._java_bytestring(sealed_obj.encodedParams)
+        encrypted_content = getattr(sealed_obj, "encryptedContent", None)
+        if encrypted_content:
+            encrypted_content = cls._java_bytes_field(sealed_obj, "encryptedContent", "javax.crypto.SealedObject")
+            sealed_obj.encryptedContent = encrypted_content
+        encoded_params = getattr(sealed_obj, "encodedParams", None)
+        if encoded_params:
+            encoded_params = cls._java_bytes_field(sealed_obj, "encodedParams", "javax.crypto.SealedObject")
+            sealed_obj.encodedParams = encoded_params
 
         entry = SecretKeyEntry(sealed_obj=sealed_obj, store_type=store_type)
         return entry, pos
@@ -733,6 +759,129 @@ class KeyStore(AbstractKeystore):
         obj_size = data_stream.tell()
 
         return obj, pos + obj_size
+
+    @classmethod
+    def _java_class_of(cls, obj):
+        """Returns the JavaClass describing the type of the given object, or
+        raise UnexpectedJavaTypeException if the object has no class metadata.
+        """
+        clazz = obj.get_class() if hasattr(obj, "get_class") else None
+        if clazz is None or not getattr(clazz, "name", None):
+            raise UnexpectedJavaTypeException("Encountered serialized Java object without class metadata; expected a named class")
+        return clazz
+
+    @classmethod
+    def _java_require_direct_class(cls, clazz):
+        """Allowed secret key representations are exact classes (SecretKeySpec
+        and KeyRep both extend java.lang.Object only). Reject objects that
+        smuggle in state through an unexpected superclass descriptor, and
+        reject a serialVersionUID that does not match the JDK class.
+        """
+        if clazz.superclass is not None:
+            raise UnexpectedJavaTypeException("Serialized Java object of type '%s' has unexpected superclass '%s'; expected a direct java.lang.Object subclass" % (clazz.name, getattr(clazz.superclass, "name", "?")))
+        expected_suid = {
+            "javax.crypto.spec.SecretKeySpec": 6577238317307289933,
+            "java.security.KeyRep": -4757683898830641853,
+            }.get(clazz.name)
+        if expected_suid is not None and clazz.serialVersionUID != expected_suid:
+            raise UnexpectedJavaTypeException("Serialized Java object of type '%s' has serialVersionUID %s; expected %s" % (clazz.name, clazz.serialVersionUID, expected_suid))
+
+    @classmethod
+    def _java_declared_field(cls, obj, field_name):
+        """Finds the class descriptor entry for a field, walking the superclass
+        chain (as Java serialization does for inherited fields).
+        """
+        clazz = cls._java_class_of(obj)
+        depth = 0
+        while clazz:
+            if field_name in clazz.fields_names:
+                return clazz.fields_types[clazz.fields_names.index(field_name)]
+            clazz = clazz.superclass
+            depth += 1
+            if depth > 100:
+                raise UnexpectedJavaTypeException("Excessively deep or cyclic superclass chain in serialized Java object of type '%s'" % cls._java_class_of(obj).name)
+        raise UnexpectedJavaTypeException("Serialized Java object of type '%s' is missing required field '%s'" % (cls._java_class_of(obj).name, field_name))
+
+    @classmethod
+    def _java_field(cls, obj, field_name, expected_class_name):
+        """Returns the given field from the object, verifying that the field is
+        actually declared by the object's class (or one of its superclasses).
+        This prevents a field that was declared with an incompatible type (or
+        omitted entirely) from being used in place of the expected value.
+        """
+        cls._java_declared_field(obj, field_name)
+        return getattr(obj, field_name)
+
+    @classmethod
+    def _java_declared_type(cls, obj, field_name):
+        """Returns the serialization type code that the object's class declares
+        for the given field (e.g. 'Ljava/lang/String;' or '[B').
+        """
+        return str(cls._java_declared_field(obj, field_name))
+
+    @classmethod
+    def _java_string_field(cls, obj, field_name, expected_class_name):
+        """Reads a serialized Java String field, rejecting values that javaobj
+        deserialized as a different type (e.g. a byte array that happens to be
+        referenced from a String field).
+        """
+        if cls._java_declared_type(obj, field_name) != "Ljava/lang/String;":
+            raise UnexpectedJavaTypeException("Field '%s' of serialized Java object of type '%s' should be declared as java.lang.String" % (field_name, expected_class_name))
+        value = cls._java_field(obj, field_name, expected_class_name)
+        if not isinstance(value, py23basestring):
+            raise UnexpectedJavaTypeException("Field '%s' of serialized Java object of type '%s' should be a String, found '%s'" % (field_name, expected_class_name, type(value).__name__))
+        return value
+
+    @classmethod
+    def _java_bytes_field(cls, obj, field_name, expected_class_name):
+        """Reads a serialized Java byte[] field as a Python byte string,
+        rejecting values of any other serialized type.
+        """
+        if cls._java_declared_type(obj, field_name) != "[B":
+            raise UnexpectedJavaTypeException("Field '%s' of serialized Java object of type '%s' should be declared as byte[]" % (field_name, expected_class_name))
+        value = cls._java_field(obj, field_name, expected_class_name)
+        if isinstance(value, py23basestring):
+            raise UnexpectedJavaTypeException("Field '%s' of serialized Java object of type '%s' should be a byte[], found a String" % (field_name, expected_class_name))
+        try:
+            return cls._java_bytestring(value)
+        except (TypeError, struct.error):
+            raise UnexpectedJavaTypeException("Field '%s' of serialized Java object of type '%s' should be a byte[], found '%s'" % (field_name, expected_class_name, type(value).__name__))
+
+    @classmethod
+    def _java_enum_constant(cls, obj, field_name, expected_class_name):
+        """Returns the enum constant name of a serialized Java enum field,
+        rejecting non-enum values and enums of a different type.
+        """
+        declared_type = cls._java_declared_type(obj, field_name)
+        allowed_declared_types = ("L%s;" % expected_class_name.replace('.', '/'), "L%s;" % expected_class_name)
+        if declared_type not in allowed_declared_types:
+            raise UnexpectedJavaTypeException("Field '%s' of serialized Java object of type '%s' should be declared as '%s'" % (field_name, expected_class_name.split('.')[-1], expected_class_name))
+        value = cls._java_field(obj, field_name, expected_class_name)
+        if isinstance(value, py23basestring) or not hasattr(value, "get_class"):
+            raise UnexpectedJavaTypeException("Field '%s' of serialized Java object of type '%s' should be an enum, found '%s'" % (field_name, expected_class_name, type(value).__name__))
+        enum_class = cls._java_class_of(value)
+        if enum_class.name != expected_class_name:
+            raise UnexpectedJavaTypeException("Expected enum of type '%s' for field '%s', found '%s'" % (expected_class_name, field_name, enum_class.name))
+        # Java serializes enums with the SC_ENUM class descriptor flag and no
+        # instance fields; a plain serializable object of the same name is not
+        # a valid enum and must not be accepted based on its constant alone.
+        if not (getattr(enum_class, "flags", 0) & 0x10) or enum_class.fields_names:
+            raise UnexpectedJavaTypeException("Serialized value of type '%s' is not a valid enum descriptor" % enum_class.name)
+        constant = getattr(value, "constant", None)
+        if not isinstance(constant, py23basestring):
+            raise UnexpectedJavaTypeException("Enum value of type '%s' does not have a valid constant name" % enum_class.name)
+        return constant
+
+    @classmethod
+    def _check_secret_key_material(cls, algorithm, key, source_type, alias):
+        """Rejects decrypted secret key representations that Java itself would
+        not accept: SecretKeySpec throws IllegalArgumentException for an empty
+        algorithm name or empty key material.
+        """
+        if len(str(algorithm)) == 0:
+            raise UnexpectedJavaTypeException("Secret key for '%s' has an empty algorithm name in serialized %s object" % (alias, source_type))
+        if len(key) == 0:
+            raise UnexpectedJavaTypeException("Secret key for '%s' has empty key material in serialized %s object" % (alias, source_type))
 
     @classmethod
     def _java_is_subclass(cls, obj, class_name):
