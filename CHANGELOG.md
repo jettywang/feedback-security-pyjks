@@ -1,5 +1,14 @@
 # PyJKS CHANGELOG
 
+Unreleased
+----------
+
+* Add ``jks.tls`` (and ``docs/tls.rst``) with explicit checks between
+  decryption and TLS hand-off: public-key leaf matching, signature- and
+  name-gated chain links over an unordered ``cert_chain``, CA/path-length
+  checks, and separate reporting for trust roots, validity, and EKU.
+  Unperformed checks are returned as ``UNVERIFIED``.
+
 Broadly speaking, the PyJKS has been stable since 2017. The JKS
 formats themselves do not change rapidly, either. The original author
 no longer uses JKS on a daily basis, but the team is happy to respond

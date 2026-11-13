@@ -17,7 +17,9 @@ encrypted material locked within JKS files. Now, PyJKS changes that.
 Examples
 --------
 
-See the :doc:`examples` page for usage examples of PyJKS.
+See the :doc:`examples` page for usage examples of PyJKS, and
+:doc:`tls` for the checks required before a private key entry is
+handed to a TLS implementation.
 
 Installation
 ------------
