@@ -8,6 +8,20 @@ submitted by active PyJKS users.
 
 PyJKS uses the [CalVer](https://calver.org) versioning scheme (`YY.MINOR.MICRO`).
 
+unreleased
+----------
+
+* Keystore integrity is now verified before any key entry decryption
+  is attempted (JKS/JCEKS/BKS); malformed or tampered stores are
+  rejected without performing password-based decryption or inner Java
+  object deserialization work
+* Loading a JKS/JCEKS keystore with ``store_password=None`` still
+  skips integrity verification, but now emits a ``UserWarning`` to
+  make that explicit, and no longer attempts to decrypt key entries
+* Truncated or malformed serialized Java objects inside JCEKS stores
+  now raise ``BadKeystoreFormatException`` instead of propagating
+  raw ``javaobj`` errors
+
 v20.0.0
 -------
 *(April 18, 2020)*

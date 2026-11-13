@@ -31,6 +31,7 @@ import ctypes
 import hashlib
 import javaobj
 import time
+import warnings
 from pyasn1.codec.ber import encoder, decoder
 from pyasn1_modules import rfc5208
 from pyasn1_modules.rfc2459 import AlgorithmIdentifier
@@ -453,6 +454,19 @@ class KeyStore(AbstractKeystore):
         decryption attempt, and returns all key entries in encrypted
         form.
 
+        The integrity of the keystore as a whole is always verified
+        before any key entry decryption is attempted, so malformed or
+        tampered stores are rejected without performing any
+        password-based decryption work. The integrity digest covers the
+        store up to the end of the last entry; any trailing data after
+        the digest itself is ignored, mirroring the tolerance of other
+        JKS implementations.
+
+        If ``store_password`` is ``None``, the store is parsed and
+        returned *without* any integrity verification having taken
+        place; a :class:`UserWarning` is emitted to make that explicit,
+        and no key decryption is attempted either.
+
         You can query whether a returned entry object has already been
         decrypted by calling the :meth:`is_decrypted` method on it.
         Attempting to access attributes of an entry that has not yet
@@ -461,7 +475,9 @@ class KeyStore(AbstractKeystore):
 
         :param bytes data: Byte string representation of the keystore
           to be loaded.
-        :param str password: Keystore password string
+        :param str password: Keystore password string, or ``None`` to
+          skip integrity verification (not recommended; a warning is
+          emitted)
         :param bool try_decrypt_keys: Whether to automatically try to
           decrypt any encountered key entries using the same password
           as the keystore password.
@@ -524,12 +540,6 @@ class KeyStore(AbstractKeystore):
                 entry.alias = alias
                 entry.timestamp = timestamp
 
-                if try_decrypt_keys:
-                    try:
-                        entry.decrypt(store_password)
-                    except DecryptionFailureException:
-                        pass # ok, let user call decrypt() manually
-
                 if alias in entries:
                     raise DuplicateAliasException("Found duplicate alias '%s'" % alias)
                 entries[alias] = entry
@@ -537,11 +547,19 @@ class KeyStore(AbstractKeystore):
         except struct.error as e:
             raise BadKeystoreFormatException(e)
 
-        # skip integrity check if no password is provided
+        # skip integrity check if no password is provided; make it
+        # explicit to the caller that the store's integrity has not
+        # been verified
         if store_password is None:
+            warnings.warn("No store password supplied; returning the "
+                          "keystore WITHOUT verifying its integrity",
+                          UserWarning, stacklevel=2)
             return cls(store_type, entries)
 
-        # check keystore integrity (uses UTF-16BE encoding of the password)
+        # check keystore integrity (uses UTF-16BE encoding of the
+        # password) before decrypting any entries; the digest covers
+        # everything up to the end of the last entry, so trailing data
+        # after the digest is tolerated for compatibility
         hash_fn = hashlib.sha1
         hash_digest_size = hash_fn().digest_size
 
@@ -555,6 +573,13 @@ class KeyStore(AbstractKeystore):
                                                      hash_digest_size))
         if expected_hash != found_hash:
             raise KeystoreSignatureException("Hash mismatch; incorrect keystore password?")
+
+        if try_decrypt_keys:
+            for entry in entries.values():
+                try:
+                    entry.decrypt(store_password)
+                except DecryptionFailureException:
+                    pass # ok, let user call decrypt() manually
 
         return cls(store_type, entries)
 
@@ -729,7 +754,10 @@ class KeyStore(AbstractKeystore):
     @classmethod
     def _read_java_obj(cls, data, pos, ignore_remaining_data=False):
         data_stream = BytesIO(data[pos:])
-        obj = javaobj.load(data_stream, ignore_remaining_data=ignore_remaining_data)
+        try:
+            obj = javaobj.load(data_stream, ignore_remaining_data=ignore_remaining_data)
+        except Exception as e:
+            raise BadKeystoreFormatException("Failed to parse serialized Java object at position %d: %s" % (pos, e))
         obj_size = data_stream.tell()
 
         return obj, pos + obj_size

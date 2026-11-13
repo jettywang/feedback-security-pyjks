@@ -251,6 +251,10 @@ class BksKeyStore(AbstractKeystore):
         """
         See :meth:`jks.jks.KeyStore.loads`.
 
+        The entry region is parsed up to and including the null
+        terminator entry, and the store HMAC over exactly that region
+        is verified before any entry decryption is attempted.
+
         :param bytes data: Byte string representation of the keystore to be loaded.
         :param str password: Keystore password string
         :param bool try_decrypt_keys: Whether to automatically try to decrypt any encountered key entries using the same password
@@ -276,7 +280,7 @@ class BksKeyStore(AbstractKeystore):
             iteration_count = b4.unpack_from(data, pos)[0]; pos += 4
 
             store_type = "bks"
-            entries, size = cls._load_bks_entries(data[pos:], store_type, store_password, try_decrypt_keys=try_decrypt_keys)
+            entries, size = cls._load_bks_entries(data[pos:], store_type)
 
             hmac_fn = hashlib.sha1
             hmac_digest_size = hmac_fn().digest_size
@@ -294,13 +298,22 @@ class BksKeyStore(AbstractKeystore):
             computed_hmac = hmac.digest()
             if store_hmac != computed_hmac:
                 raise KeystoreSignatureException("Hash mismatch; incorrect keystore password?")
+
+            if try_decrypt_keys:
+                cls._decrypt_bks_entries(entries, store_password)
             return cls(store_type, entries, version=version)
 
         except struct.error as e:
             raise BadKeystoreFormatException(e)
 
     @classmethod
-    def _load_bks_entries(cls, data, store_type, store_password, try_decrypt_keys=False):
+    def _load_bks_entries(cls, data, store_type):
+        """Parses the BKS entry region, stopping at the null terminator
+        entry (type 0), and returns the parsed entries along with the
+        number of bytes consumed (terminator included). No decryption
+        is performed here; callers are expected to verify the store's
+        integrity over the consumed region before decrypting entries.
+        """
         entries = {}
         pos = 0
         while pos < len(data):
@@ -332,17 +345,19 @@ class BksKeyStore(AbstractKeystore):
             entry.timestamp = timestamp
             entry.cert_chain = cert_chain
 
-            if try_decrypt_keys:
-                try:
-                    entry.decrypt(store_password)
-                except DecryptionFailureException:
-                    pass # ok, let user call .decrypt() manually afterwards
-
             if alias in entries:
                 raise DuplicateAliasException("Found duplicate alias '%s'" % alias)
             entries[alias] = entry
 
         return (entries, pos)
+
+    @classmethod
+    def _decrypt_bks_entries(cls, entries, store_password):
+        for entry in entries.values():
+            try:
+                entry.decrypt(store_password)
+            except DecryptionFailureException:
+                pass # ok, let user call .decrypt() manually afterwards
 
     @classmethod
     def _read_bks_cert(cls, data, pos, store_type):
@@ -438,7 +453,9 @@ class UberKeyStore(BksKeyStore):
                 raise KeystoreSignatureException("Hash mismatch; incorrect keystore password?")
 
             store_type = "uber"
-            entries, size = cls._load_bks_entries(bks_store, store_type, store_password, try_decrypt_keys=try_decrypt_keys)
+            entries, size = cls._load_bks_entries(bks_store, store_type)
+            if try_decrypt_keys:
+                cls._decrypt_bks_entries(entries, store_password)
             return cls(store_type, entries, version=version)
 
         except struct.error as e:

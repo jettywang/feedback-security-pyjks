@@ -10,6 +10,7 @@ import os
 import sys
 import unittest
 import hashlib
+import warnings
 
 import jks
 from jks.util import py23basestring
@@ -789,6 +790,150 @@ class MiscTests(AbstractTest):
         pk = self.find_private_key(store, "mykey")
         self.check_pkey_and_certs_equal(pk, jks.util.RSA_ENCRYPTION_OID, expected.RSA1024.private_key, expected.RSA1024.certs)
         dummy = pk.cert_chain
+
+class DecryptCallCounter(object):
+    """Context manager recording the actual decrypt() invocations made
+    on a given entry class while loading a keystore."""
+    def __init__(self, entry_class):
+        self.entry_class = entry_class
+        self.aliases = []
+        self._original_decrypt = entry_class.decrypt
+
+    def __enter__(self):
+        original_decrypt = self._original_decrypt
+        aliases = self.aliases
+        def counting_decrypt(entry, password):
+            aliases.append(entry.alias)
+            return original_decrypt(entry, password)
+        self.entry_class.decrypt = counting_decrypt
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.entry_class.decrypt = self._original_decrypt
+        return False
+
+def _read_keystore(relative_path):
+    with open(os.path.join(KS_PATH, relative_path), "rb") as f:
+        return f.read()
+
+def _corrupt_last_byte(data):
+    corrupted = bytearray(data)
+    corrupted[-1] ^= 0xFF
+    return bytes(corrupted)
+
+class IntegrityBeforeDecryptTests(AbstractTest):
+    """
+    Verifies that whole-store integrity is verified before any entry
+    decryption is attempted, by recording actual decrypt() call counts
+    for valid stores, stores with a bad integrity value, and truncated
+    stores.
+    """
+    def test_jks_valid_store(self):
+        with DecryptCallCounter(jks.PrivateKeyEntry) as counter:
+            store = jks.KeyStore.load(KS_PATH + "/jks/RSA1024.jks", "12345678")
+        self.assertEqual(counter.aliases, ["mykey"])
+        pk = self.find_private_key(store, "mykey")
+        self.assertTrue(pk.is_decrypted())
+        self.check_pkey_and_certs_equal(pk, jks.util.RSA_ENCRYPTION_OID, expected.RSA1024.private_key, expected.RSA1024.certs)
+
+    def test_jks_bad_signature_no_decrypt(self):
+        store_bytes = _read_keystore("jks/RSA1024.jks")
+        with DecryptCallCounter(jks.PrivateKeyEntry) as counter:
+            self.assertRaises(jks.util.KeystoreSignatureException,
+                              jks.KeyStore.loads, _corrupt_last_byte(store_bytes), "12345678")
+        self.assertEqual(counter.aliases, [])
+
+    def test_jks_truncated_no_decrypt(self):
+        store_bytes = _read_keystore("jks/RSA1024.jks")
+        with DecryptCallCounter(jks.PrivateKeyEntry) as counter:
+            # truncated inside the entry data
+            self.assertRaises(jks.util.BadKeystoreFormatException,
+                              jks.KeyStore.loads, store_bytes[:len(store_bytes)//2], "12345678")
+            # truncated integrity digest
+            self.assertRaises(jks.util.BadKeystoreFormatException,
+                              jks.KeyStore.loads, store_bytes[:-10], "12345678")
+        self.assertEqual(counter.aliases, [])
+
+    def test_jceks_valid_store(self):
+        with DecryptCallCounter(jks.SecretKeyEntry) as counter:
+            store = jks.KeyStore.load(KS_PATH + "/jceks/AES128.jceks", "12345678")
+        self.assertEqual(counter.aliases, ["mykey"])
+        sk = self.find_secret_key(store, "mykey")
+        self.assertTrue(sk.is_decrypted())
+        self.assertEqual(sk.algorithm, "AES")
+        self.assertEqual(sk.key_size, 128)
+
+    def test_jceks_bad_signature_no_decrypt(self):
+        store_bytes = _read_keystore("jceks/AES128.jceks")
+        with DecryptCallCounter(jks.SecretKeyEntry) as counter:
+            self.assertRaises(jks.util.KeystoreSignatureException,
+                              jks.KeyStore.loads, _corrupt_last_byte(store_bytes), "12345678")
+        self.assertEqual(counter.aliases, [])
+
+    def test_jceks_truncated_no_decrypt(self):
+        store_bytes = _read_keystore("jceks/AES128.jceks")
+        with DecryptCallCounter(jks.SecretKeyEntry) as counter:
+            self.assertRaises(jks.util.BadKeystoreFormatException,
+                              jks.KeyStore.loads, store_bytes[:len(store_bytes)//2], "12345678")
+            self.assertRaises(jks.util.BadKeystoreFormatException,
+                              jks.KeyStore.loads, store_bytes[:-10], "12345678")
+        self.assertEqual(counter.aliases, [])
+
+    def test_bks_valid_store(self):
+        with DecryptCallCounter(jks.bks.BksSealedKeyEntry) as counter:
+            store = jks.bks.BksKeyStore.load(KS_PATH + "/bks/christmas.bksv2", "12345678")
+        self.assertEqual(sorted(counter.aliases),
+                         ["sealed_private_key", "sealed_public_key", "sealed_secret_key"])
+        self.assertTrue(all(e.is_decrypted() for e in store.sealed_keys.values()))
+
+    def test_bks_bad_hmac_no_decrypt(self):
+        store_bytes = _read_keystore("bks/christmas.bksv2")
+        with DecryptCallCounter(jks.bks.BksSealedKeyEntry) as counter:
+            self.assertRaises(jks.util.KeystoreSignatureException,
+                              jks.bks.BksKeyStore.loads, _corrupt_last_byte(store_bytes), "12345678")
+        self.assertEqual(counter.aliases, [])
+
+    def test_bks_truncated_no_decrypt(self):
+        store_bytes = _read_keystore("bks/christmas.bksv2")
+        with DecryptCallCounter(jks.bks.BksSealedKeyEntry) as counter:
+            # truncated inside the entry data
+            self.assertRaises(jks.util.BadKeystoreFormatException,
+                              jks.bks.BksKeyStore.loads, store_bytes[:len(store_bytes)//2], "12345678")
+            # truncated HMAC
+            self.assertRaises(jks.util.BadKeystoreFormatException,
+                              jks.bks.BksKeyStore.loads, store_bytes[:-10], "12345678")
+        self.assertEqual(counter.aliases, [])
+
+    def test_uber_valid_store(self):
+        with DecryptCallCounter(jks.bks.BksSealedKeyEntry) as counter:
+            store = jks.bks.UberKeyStore.load(KS_PATH + "/uber/christmas.uber", "12345678")
+        self.assertEqual(sorted(counter.aliases),
+                         ["sealed_private_key", "sealed_public_key", "sealed_secret_key"])
+        self.assertTrue(all(e.is_decrypted() for e in store.sealed_keys.values()))
+
+    def test_uber_bad_password_no_decrypt(self):
+        store_bytes = _read_keystore("uber/christmas.uber")
+        with DecryptCallCounter(jks.bks.BksSealedKeyEntry) as counter:
+            self.assertRaises(jks.util.DecryptionFailureException,
+                              jks.bks.UberKeyStore.loads, store_bytes, "wrong_password")
+        self.assertEqual(counter.aliases, [])
+
+    def test_store_password_none_warns_about_missing_integrity_check(self):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            store = jks.KeyStore.load(KS_PATH + "/jks/truststore.jks", None)
+        self.assertEqual(len(store.entries), 2)
+        self.assertTrue(any(issubclass(w.category, UserWarning) and
+                            "integrity" in str(w.message)
+                            for w in caught))
+
+    def test_store_password_none_does_not_decrypt(self):
+        with DecryptCallCounter(jks.PrivateKeyEntry) as counter:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                store = jks.KeyStore.load(KS_PATH + "/jks/RSA1024.jks", None)
+        self.assertEqual(counter.aliases, [])
+        self.assertFalse(store.private_keys["mykey"].is_decrypted())
 
 if __name__ == "__main__":
     unittest.main()
