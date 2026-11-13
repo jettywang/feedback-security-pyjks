@@ -148,6 +148,145 @@ class JksTests(AbstractTest):
         self.assertEqual(store.store_type, "jks")
         self.check_pkey_and_certs_equal(pk, jks.util.RSA_ENCRYPTION_OID, expected.jks_non_ascii_password.private_key, expected.jks_non_ascii_password.certs)
 
+    def test_save_does_not_mutate_loaded_private_key(self):
+        store = jks.KeyStore.load(KS_PATH + "/jks/RSA2048_3certs.jks", "12345678")
+        pk = self.find_private_key(store, "mykey")
+        self.assertTrue(pk.is_decrypted())
+        original_pkey = pk.pkey
+        original_pkcs8 = pk.pkey_pkcs8
+        original_algorithm_oid = pk.algorithm_oid
+        original_cert_chain = list(pk.cert_chain)
+        original_timestamp = pk.timestamp
+
+        # first save succeeds, and must leave the in-memory entry usable
+        first_save = store.saves("12345678")
+        self.assertTrue(pk.is_decrypted())
+        self.assertEqual(pk.pkey, original_pkey)
+        self.assertEqual(pk.pkey_pkcs8, original_pkcs8)
+        self.assertEqual(pk.algorithm_oid, original_algorithm_oid)
+        self.assertEqual(pk.cert_chain, original_cert_chain)
+        self.assertEqual(pk.timestamp, original_timestamp)
+
+        # an unsupported entry makes the next save fail without touching anything
+        store.entries["unsupported"] = jks.SecretKeyEntry(alias="unsupported", store_type="jks")
+        self.assertRaises(jks.util.UnsupportedKeystoreEntryTypeException, store.saves, "12345678")
+        self.assertTrue(pk.is_decrypted())
+        self.assertEqual(pk.pkey, original_pkey)
+        self.assertEqual(pk.pkey_pkcs8, original_pkcs8)
+        self.assertEqual(pk.algorithm_oid, original_algorithm_oid)
+        self.assertEqual(pk.cert_chain, original_cert_chain)
+        self.assertEqual(pk.timestamp, original_timestamp)
+
+        # the entry was not modified by the failed save; a follow-up save is consistent
+        del store.entries["unsupported"]
+        second_save = store.saves("12345678")
+        self.assertTrue(pk.is_decrypted())
+        self.assertEqual(pk.pkey, original_pkey)
+        self.assertEqual(pk.cert_chain, original_cert_chain)
+        self.assertEqual(pk.timestamp, original_timestamp)
+
+        first_reload = jks.KeyStore.loads(first_save, "12345678")
+        second_reload = jks.KeyStore.loads(second_save, "12345678")
+        first_pk = self.find_private_key(first_reload, "mykey")
+        second_pk = self.find_private_key(second_reload, "mykey")
+        self.check_pkey_and_certs_equal(first_pk, original_algorithm_oid, original_pkcs8, [c[1] for c in original_cert_chain])
+        self.check_pkey_and_certs_equal(second_pk, original_algorithm_oid, original_pkcs8, [c[1] for c in original_cert_chain])
+        self.assertEqual(first_pk.timestamp, original_timestamp)
+        self.assertEqual(second_pk.timestamp, original_timestamp)
+        self.assertEqual(first_pk.cert_chain, original_cert_chain)
+        self.assertEqual(second_pk.cert_chain, original_cert_chain)
+
+    def test_save_failure_during_second_entry_does_not_mutate_first(self):
+        store = jks.KeyStore.load(KS_PATH + "/jks/RSA2048_3certs.jks", "12345678")
+        pk = self.find_private_key(store, "mykey")
+        self.assertTrue(pk.is_decrypted())
+        original_pkey = pk.pkey
+        original_pkcs8 = pk.pkey_pkcs8
+        original_cert_chain = list(pk.cert_chain)
+        original_timestamp = pk.timestamp
+
+        # a second entry that will fail while its own output is being built
+        bad = jks.PrivateKeyEntry.new("zzz_bad", expected.RSA1024.certs, expected.RSA1024.private_key)
+        bad.cert_chain = None
+        store.entries["zzz_bad"] = bad
+
+        self.assertRaises(TypeError, store.saves, "12345678")
+        self.assertTrue(pk.is_decrypted())
+        self.assertEqual(pk.pkey, original_pkey)
+        self.assertEqual(pk.pkey_pkcs8, original_pkcs8)
+        self.assertEqual(pk.cert_chain, original_cert_chain)
+        self.assertEqual(pk.timestamp, original_timestamp)
+
+        del store.entries["zzz_bad"]
+        recovered = store.saves("12345678")
+        self.assertTrue(pk.is_decrypted())
+        reloaded = jks.KeyStore.loads(recovered, "12345678")
+        reloaded_pk = self.find_private_key(reloaded, "mykey")
+        self.check_pkey_and_certs_equal(reloaded_pk, jks.util.RSA_ENCRYPTION_OID,
+                                        original_pkcs8, [c[1] for c in original_cert_chain])
+        self.assertEqual(reloaded_pk.timestamp, original_timestamp)
+
+    def test_save_keeps_encrypted_entry_ciphertext(self):
+        with open(KS_PATH + "/jks/custom_entry_passwords.jks", "rb") as file:
+            keystore_bytes = file.read()
+        store = jks.KeyStore.loads(keystore_bytes, "store_password", try_decrypt_keys=False)
+        pk = self.find_private_key(store, "private")
+        self.assertFalse(pk.is_decrypted())
+        original_ciphertext = pk._encrypted
+        original_cert_chain = list(pk.cert_chain)
+        original_timestamp = pk.timestamp
+
+        # saving with the store password must not re-encrypt an already
+        # encrypted entry with that password
+        resaved = store.saves("store_password")
+        self.assertEqual(resaved, keystore_bytes)
+        self.assertFalse(pk.is_decrypted())
+        self.assertEqual(pk._encrypted, original_ciphertext)
+        self.assertEqual(pk.cert_chain, original_cert_chain)
+        self.assertEqual(pk.timestamp, original_timestamp)
+
+        reloaded = jks.KeyStore.loads(resaved, "store_password", try_decrypt_keys=False)
+        reloaded_pk = self.find_private_key(reloaded, "private")
+        self.assertFalse(reloaded_pk.is_decrypted())
+        self.assertEqual(reloaded_pk._encrypted, original_ciphertext)
+        self.assertEqual(reloaded_pk.timestamp, original_timestamp)
+        reloaded_pk.decrypt("private_password")
+        self.assertTrue(reloaded_pk.is_decrypted())
+        self.check_pkey_and_certs_equal(reloaded_pk, jks.util.RSA_ENCRYPTION_OID,
+                                        expected.custom_entry_passwords.private_key,
+                                        expected.custom_entry_passwords.certs)
+
+    def test_save_failure_then_success_preserves_encrypted_view(self):
+        with open(KS_PATH + "/jks/RSA2048_3certs.jks", "rb") as file:
+            keystore_bytes = file.read()
+        store = jks.KeyStore.loads(keystore_bytes, "12345678", try_decrypt_keys=False)
+        pk = self.find_private_key(store, "mykey")
+        self.assertFalse(pk.is_decrypted())
+        original_ciphertext = pk._encrypted
+        original_cert_chain = list(pk.cert_chain)
+        original_timestamp = pk.timestamp
+
+        first_save = store.saves("12345678")
+        self.assertEqual(first_save, keystore_bytes)
+
+        store.entries["unsupported"] = jks.SecretKeyEntry(alias="unsupported", store_type="jks")
+        self.assertRaises(jks.util.UnsupportedKeystoreEntryTypeException, store.saves, "12345678")
+        self.assertFalse(pk.is_decrypted())
+        self.assertEqual(pk._encrypted, original_ciphertext)
+        self.assertEqual(pk.cert_chain, original_cert_chain)
+        self.assertEqual(pk.timestamp, original_timestamp)
+
+        del store.entries["unsupported"]
+        second_save = store.saves("12345678")
+        self.assertEqual(second_save, first_save)
+
+        reloaded = jks.KeyStore.loads(second_save, "12345678", try_decrypt_keys=False)
+        reloaded_pk = self.find_private_key(reloaded, "mykey")
+        self.assertFalse(reloaded_pk.is_decrypted())
+        self.assertEqual(reloaded_pk._encrypted, original_ciphertext)
+        self.assertEqual(reloaded_pk.timestamp, original_timestamp)
+        self.assertEqual(reloaded_pk.cert_chain, original_cert_chain)
+
     def test_load_and_save_rsa_keystore(self):
         with open(KS_PATH + "/jks/RSA2048_3certs.jks", 'rb') as file:
             keystore_bytes = file.read()

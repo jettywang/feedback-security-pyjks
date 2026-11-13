@@ -98,7 +98,8 @@ Generating a basic self signed certificate with OpenSSL and saving it in a jks k
 	pke = jks.PrivateKeyEntry.new('self signed cert', [dumped_cert], dumped_key, 'rsa_raw')
 
 	# if we want the private key entry to have a unique password, we can encrypt it beforehand
-	# if it is not ecrypted when saved, it will be encrypted with the same password as the keystore
+	# if it is not encrypted when saved, it will be encrypted with the same password as the keystore
+	# (saving does not alter the entry itself; a previously encrypted entry keeps its ciphertext)
 	#pke.encrypt('my_private_key_password')
 
 	# creating a jks keystore with the private key, and saving it

@@ -226,6 +226,36 @@ class PrivateKeyEntry(AbstractKeystoreEntry):
         self._pkey_pkcs8 = plaintext
         self._algorithm_oid = algorithm_oid
 
+    def _encrypt_pkcs8(self, key_password):
+        """Builds an EncryptedPrivateKeyInfo for the plaintext key without
+        modifying the entry."""
+        encrypted_private_key = sun_crypto.jks_pkey_encrypt(self.pkey_pkcs8, key_password)
+
+        a = AlgorithmIdentifier()
+        a.setComponentByName('algorithm', sun_crypto.SUN_JKS_ALGO_ID)
+        a.setComponentByName('parameters', '\x05\x00')
+        epki = rfc5208.EncryptedPrivateKeyInfo()
+        epki.setComponentByName('encryptionAlgorithm',a)
+        epki.setComponentByName('encryptedData', encrypted_private_key)
+
+        return encoder.encode(epki)
+
+    def _encrypted_for_save(self, key_password):
+        """Returns the encrypted private key bytes to write to a keystore.
+
+        Unlike :meth:`encrypt`, this method never changes the entry. An
+        entry that is still encrypted keeps its original ciphertext, so
+        saving it with a different store password does not silently
+        re-encrypt it with that password. A decrypted entry is encrypted
+        only for the resulting output.
+
+        :param str key_password: The password to encrypt decrypted key
+          material with.
+        """
+        if not self.is_decrypted():
+            return self._encrypted
+        return self._encrypt_pkcs8(key_password)
+
     def encrypt(self, key_password):
         """
         Encrypts the private key, so that it can be saved to a keystore.
@@ -238,16 +268,7 @@ class PrivateKeyEntry(AbstractKeystoreEntry):
         if not self.is_decrypted():
             return
 
-        encrypted_private_key = sun_crypto.jks_pkey_encrypt(self.pkey_pkcs8, key_password)
-
-        a = AlgorithmIdentifier()
-        a.setComponentByName('algorithm', sun_crypto.SUN_JKS_ALGO_ID)
-        a.setComponentByName('parameters', '\x05\x00')
-        epki = rfc5208.EncryptedPrivateKeyInfo()
-        epki.setComponentByName('encryptionAlgorithm',a)
-        epki.setComponentByName('encryptedData', encrypted_private_key)
-
-        self._encrypted = encoder.encode(epki)
+        self._encrypted = self._encrypt_pkcs8(key_password)
         self._pkey = None
         self._pkey_pkcs8 = None
         self._algorithm_oid = None
@@ -563,8 +584,7 @@ class KeyStore(AbstractKeystore):
         private_key_entry = b4.pack(1) # private key
         private_key_entry += cls._write_utf(alias)
         private_key_entry += b8.pack(item.timestamp)
-        item.encrypt(key_password)
-        private_key_entry += cls._write_data(item._encrypted)
+        private_key_entry += cls._write_data(item._encrypted_for_save(key_password))
 
         private_key_entry += b4.pack(len(item.cert_chain))
         for cert in item.cert_chain:
@@ -586,8 +606,15 @@ class KeyStore(AbstractKeystore):
         """
         Saves the keystore so that it can be read by other applications.
 
-        If any of the private keys are unencrypted, they will be encrypted
-        with the same password as the keystore.
+        Saving does not modify any of the entries. Private key entries that
+        are still encrypted are written with their existing ciphertext;
+        they are not re-encrypted with the supplied store password. Private
+        key entries that have been decrypted are encrypted for the output
+        (with the supplied store password) while remaining decrypted and
+        accessible on the in-memory entry.
+
+        The entries are snapshotted and validated before serialization starts,
+        so a save that fails partway through leaves every entry untouched.
 
         :param str store_password: Password for the created keystore
           (and for any unencrypted keys)
@@ -607,20 +634,30 @@ class KeyStore(AbstractKeystore):
         else:
             raise UnsupportedKeystoreTypeException("Only JKS and JCEKS keystores are supported")
 
-        keystore += b4.pack(2) # version 2
-        keystore += b4.pack(len(self.entries))
+        entries = list(self.entries.items())
 
-        for alias, item in self.entries.items():
+        # Validate the entire snapshot before serializing anything, so a
+        # save either produces output for every entry or fails without
+        # having transformed any of them.
+        for alias, item in entries:
+            if isinstance(item, TrustedCertEntry):
+                continue
+            if isinstance(item, PrivateKeyEntry):
+                continue
+            if isinstance(item, SecretKeyEntry):
+                if self.store_type != 'jceks':
+                    raise UnsupportedKeystoreEntryTypeException('Secret Key only allowed in JCEKS keystores')
+                raise NotImplementedError("Saving of Secret Keys not implemented")
+            raise UnsupportedKeystoreEntryTypeException("Unknown entry type in keystore")
+
+        keystore += b4.pack(2) # version 2
+        keystore += b4.pack(len(entries))
+
+        for alias, item in entries:
             if isinstance(item, TrustedCertEntry):
                 keystore += self._write_trusted_cert(alias, item)
             elif isinstance(item, PrivateKeyEntry):
                 keystore += self._write_private_key(alias, item, store_password)
-            elif isinstance(item, SecretKeyEntry):
-                if self.store_type != 'jceks':
-                    raise UnsupportedKeystoreEntryTypeException('Secret Key only allowed in JCEKS keystores')
-                raise NotImplementedError("Saving of Secret Keys not implemented")
-            else:
-                raise UnsupportedKeystoreEntryTypeException("Unknown entry type in keystore")
 
         hash_fn = hashlib.sha1
         store_password_utf16 = store_password.encode('utf-16be')
