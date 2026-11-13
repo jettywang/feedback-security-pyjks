@@ -48,6 +48,18 @@ def _jks_keystream(iv, password):
         for byte in cur:
             yield byte
 
+def jce_pbe_encrypt(data, password, salt, iteration_count):
+    """
+    Encrypts data with Sun's custom PBEWithMD5AndTripleDES password-based
+    encryption scheme; the inverse of :func:`jce_pbe_decrypt`.
+    """
+    key, iv = _jce_pbe_derive_key_and_iv(password, salt, iteration_count)
+
+    from Cryptodome.Cipher import DES3
+    des3 = DES3.new(key, DES3.MODE_CBC, IV=iv)
+    padded = add_pkcs7_padding(data, 8)
+    return des3.encrypt(padded)
+
 def jce_pbe_decrypt(data, password, salt, iteration_count):
     """
     Decrypts Sun's custom PBEWithMD5AndTripleDES password-based encryption scheme.

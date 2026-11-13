@@ -8,6 +8,23 @@ submitted by active PyJKS users.
 
 PyJKS uses the [CalVer](https://calver.org) versioning scheme (`YY.MINOR.MICRO`).
 
+unreleased
+----------
+
+* JCEKS keystores can now be saved, with trusted certificate, private key,
+  and secret key entries side by side. Private keys are written with the
+  JCEKS `PBEWithMD5AndTripleDES` protection scheme; secret keys are written
+  as Java `SealedObject` instances matching the SunJCE keystore layout.
+* Saving no longer modifies entries. Entries that are loaded encrypted keep
+  their existing ciphertext (and are therefore not silently re-encrypted with
+  the store password), decrypted entries are encrypted for the output only,
+  and a failed save leaves an earlier entry's encryption state and
+  certificate chain untouched.
+* New secret keys can be created with `SecretKeyEntry.new`, and explicitly
+  re-encrypted with `SecretKeyEntry.encrypt`.
+* The trailing SHA-1 integrity digest is computed over the complete
+  serialized store, for both JKS and JCEKS.
+
 v20.0.0
 -------
 *(April 18, 2020)*

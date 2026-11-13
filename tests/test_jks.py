@@ -8,6 +8,7 @@ Note: run 'mvn test' in the tests/java directory to reproduce keystore files (re
 from __future__ import print_function
 import os
 import sys
+import struct
 import unittest
 import hashlib
 
@@ -378,6 +379,241 @@ class JceTests(AbstractTest):
 
     def test_duplicate_aliases(self):
         self.assertRaises(jks.DuplicateAliasException, jks.KeyStore.load, KS_PATH + "/jceks/duplicate_aliases.jceks", "12345678")
+
+    def test_load_and_save_jceks_keystores(self):
+        """Loading and saving the published fixtures must be byte-identical for every entry type,
+        both when keys were decrypted on load and when they were left encrypted."""
+        for filename, password in [("AES128.jceks", "12345678"),
+                                   ("DES.jceks", "12345678"),
+                                   ("DESede.jceks", "12345678"),
+                                   ("PBKDF2WithHmacSHA1.jceks", "12345678"),
+                                   ("RSA1024.jceks", "12345678"),
+                                   ("RSA2048_3certs.jceks", "12345678"),
+                                   ("DSA2048.jceks", "12345678"),
+                                   ("3certs.jceks", "12345678"),
+                                   ("custom_entry_passwords.jceks", "store_password")]:
+            with open(KS_PATH + "/jceks/" + filename, 'rb') as file:
+                keystore_bytes = file.read()
+
+            store = jks.KeyStore.loads(keystore_bytes, password, False)
+            self.assertEqual(store.saves(password), keystore_bytes)
+
+            store = jks.KeyStore.loads(keystore_bytes, password, True)
+            self.assertEqual(store.saves(password), keystore_bytes)
+
+    def test_save_jceks_preserves_entry_state_and_cert_chain(self):
+        with open(KS_PATH + "/jceks/custom_entry_passwords.jceks", 'rb') as file:
+            keystore_bytes = file.read()
+        store = jks.KeyStore.loads(keystore_bytes, "store_password")
+        pk = self.find_private_key(store, "private")
+        sk = self.find_secret_key(store, "secret")
+        pk.decrypt("private_password")
+        sk.decrypt("secret_password")
+
+        original_ciphertext = pk._encrypted
+        original_cert_chain = list(pk.cert_chain)
+        original_timestamp = pk.timestamp
+        original_key = sk.key
+
+        resaved = store.saves("store_password")
+        self.assertEqual(resaved, keystore_bytes)
+
+        # the in-memory entries were not modified by the save
+        self.assertTrue(pk.is_decrypted())
+        self.assertEqual(pk._encrypted, original_ciphertext)
+        self.assertEqual(pk.cert_chain, original_cert_chain)
+        self.assertEqual(pk.timestamp, original_timestamp)
+        self.assertTrue(sk.is_decrypted())
+        self.assertEqual(sk.key, original_key)
+
+        reloaded = jks.KeyStore.loads(resaved, "store_password", False)
+        reloaded_pk = reloaded.entries["private"]
+        reloaded_pk.decrypt("private_password")
+        self.check_pkey_and_certs_equal(reloaded_pk, jks.util.RSA_ENCRYPTION_OID,
+                                        expected.custom_entry_passwords.private_key,
+                                        expected.custom_entry_passwords.certs)
+        reloaded_sk = reloaded.entries["secret"]
+        reloaded_sk.decrypt("secret_password")
+        self.assertEqual(reloaded_sk.key, original_key)
+
+    def test_save_jceks_with_new_and_reencrypted_entries(self):
+        key_bytes = b"\x66\x6e\x02\x21\xcc\x44\xc1\xfc\x4a\xab\xf4\x58\xf9\xdf\xdd\x3c"
+        sk = jks.SecretKeyEntry.new("secret", "AES", key_bytes)
+        pk = jks.PrivateKeyEntry.new("private", expected.RSA1024.certs, expected.RSA1024.private_key)
+        cert = jks.TrustedCertEntry.new("cert", expected.RSA1024.certs[0])
+        store = jks.KeyStore.new("jceks", [sk, pk, cert])
+
+        store_bytes = store.saves("12345678")
+
+        # a failed save must not change the new entries
+        broken = jks.KeyStore(store.store_type, dict(store.entries))
+        broken.entries["broken"] = object()
+        self.assertRaises(jks.util.UnsupportedKeystoreEntryTypeException, broken.saves, "12345678")
+        self.assertTrue(sk.is_decrypted())
+        self.assertTrue(pk.is_decrypted())
+        self.assertEqual(pk.cert_chain, [("X.509", expected.RSA1024.certs[0])])
+
+        reloaded = jks.KeyStore.loads(store_bytes, "12345678")
+        self.assertEqual(reloaded.store_type, "jceks")
+        self.assertEqual(sorted(reloaded.entries.keys()), ["cert", "private", "secret"])
+        reloaded_sk = reloaded.entries["secret"]
+        self.assertEqual(reloaded_sk.algorithm, "AES")
+        self.assertEqual(reloaded_sk.key_size, 128)
+        self.assertEqual(reloaded_sk.key, key_bytes)
+        reloaded_pk = reloaded.entries["private"]
+        self.check_pkey_and_certs_equal(reloaded_pk, jks.util.RSA_ENCRYPTION_OID,
+                                        expected.RSA1024.private_key, expected.RSA1024.certs)
+        self.assertEqual(reloaded.entries["cert"].cert, expected.RSA1024.certs[0])
+
+        # explicit re-encryption of secret keys with a custom password
+        reloaded_sk.decrypt("12345678")
+        reloaded_sk.encrypt("secret_password")
+        self.assertFalse(reloaded_sk.is_decrypted())
+        custom_bytes = reloaded.saves("store_password")
+        custom = jks.KeyStore.loads(custom_bytes, "store_password")
+        custom_sk = custom.entries["secret"]
+        self.assertFalse(custom_sk.is_decrypted())
+        custom_sk.decrypt("secret_password")
+        self.assertEqual(custom_sk.key, key_bytes)
+        self.assertEqual(custom_sk.algorithm, "AES")
+
+    def test_save_jceks_serialized_fields_and_integrity(self):
+        """Independently checks the serialized Java object fields and the trailing SHA-1 digest,
+        without relying on pyjks' own reader."""
+        import hashlib
+        import struct
+        from pyasn1.codec.ber import decoder
+        from jks import rfc2898, sun_crypto
+
+        key_bytes = b"\x66\x6e\x02\x21\xcc\x44\xc1\xfc\x4a\xab\xf4\x58\xf9\xdf\xdd\x3c"
+        store_password = "12345678"
+        sk = jks.SecretKeyEntry.new("secret", "AES", key_bytes)
+        pk = jks.PrivateKeyEntry.new("private", expected.RSA1024.certs, expected.RSA1024.private_key)
+        cert = jks.TrustedCertEntry.new("cert", expected.RSA1024.certs[0])
+        store_bytes = jks.KeyStore.new("jceks", [sk, pk, cert]).saves(store_password)
+
+        self.assertEqual(store_bytes[:4], b"\xce\xce\xce\xce")
+        self.assertEqual(struct.unpack_from(">L", store_bytes, 4)[0], 2)
+        self.assertEqual(struct.unpack_from(">L", store_bytes, 8)[0], 3)
+
+        # walk the entries structurally and collect field values
+        pos = 12
+        entries = {}
+        while pos < len(store_bytes) - 20:
+            tag = struct.unpack_from(">L", store_bytes, pos)[0]; pos += 4
+            alias_len = struct.unpack_from(">H", store_bytes, pos)[0]; pos += 2
+            alias = store_bytes[pos:pos + alias_len].decode("utf-8"); pos += alias_len
+            timestamp = struct.unpack_from(">Q", store_bytes, pos)[0]; pos += 8
+
+            if tag == 1:
+                blob_len = struct.unpack_from(">L", store_bytes, pos)[0]; pos += 4
+                entries[alias] = ("private", store_bytes[pos:pos + blob_len]); pos += blob_len
+                chain_len = struct.unpack_from(">L", store_bytes, pos)[0]; pos += 4
+                for _ in range(chain_len):
+                    cert_type_len = struct.unpack_from(">H", store_bytes, pos)[0]; pos += 2 + cert_type_len
+                    cert_len = struct.unpack_from(">L", store_bytes, pos)[0]; pos += 4 + cert_len
+            elif tag == 2:
+                cert_type_len = struct.unpack_from(">H", store_bytes, pos)[0]; pos += 2 + cert_type_len
+                cert_len = struct.unpack_from(">L", store_bytes, pos)[0]; pos += 4
+                entries[alias] = ("cert", store_bytes[pos:pos + cert_len]); pos += cert_len
+            elif tag == 3:
+                # secret keys are written as a bare serialized SealedObject
+                import javaobj
+                stream = jks.jks.BytesIO(store_bytes[pos:])
+                sealed = javaobj.load(stream, ignore_remaining_data=True)
+                entries[alias] = ("secret", sealed, store_bytes[pos:pos + stream.tell()])
+                pos += stream.tell()
+            else:
+                self.fail("unexpected entry tag %d" % tag)
+
+        self.assertEqual(entries["cert"][1], expected.RSA1024.certs[0])
+        self.assertFalse(entries["secret"][2].startswith(b"\x00\x00"))
+
+        # the private key blob is an EncryptedPrivateKeyInfo using the JCEKS PBE OID
+        from pyasn1_modules import rfc5208
+        epki = decoder.decode(entries["private"][1], asn1Spec=rfc5208.EncryptedPrivateKeyInfo())[0]
+        self.assertEqual(epki["encryptionAlgorithm"]["algorithm"].asTuple(), sun_crypto.SUN_JCE_ALGO_ID)
+        pbe_params = decoder.decode(epki["encryptionAlgorithm"]["parameters"].asOctets(),
+                                    asn1Spec=rfc2898.PBEParameter())[0]
+        self.assertEqual(len(pbe_params["salt"].asOctets()), 8)
+        self.assertEqual(int(pbe_params["iterationCount"]), 20)
+
+        # the sealed object's class descriptor, algorithm fields, and raw key payload
+        sealed = entries["secret"][1]
+        self.assertEqual(sealed.get_class().name,
+                         "com.sun.crypto.provider.SealedObjectForKeyProtector")
+        self.assertEqual(sealed.get_class().serialVersionUID, -3650226485480866989)
+        self.assertEqual(sealed.get_class().superclass.name, "javax.crypto.SealedObject")
+        self.assertEqual(str(sealed.sealAlg), "PBEWithMD5AndTripleDES")
+        self.assertEqual(str(sealed.paramsAlg), "PBEWithMD5AndTripleDES")
+        encoded_params = jks.KeyStore._java_bytestring(sealed.encodedParams)
+        params = decoder.decode(encoded_params, asn1Spec=rfc2898.PBEParameter())[0]
+        self.assertEqual(len(params["salt"].asOctets()), 8)
+        self.assertEqual(int(params["iterationCount"]), 20)
+
+        plaintext = sun_crypto.jce_pbe_decrypt(
+            jks.KeyStore._java_bytestring(sealed.encryptedContent),
+            store_password, params["salt"].asOctets(), int(params["iterationCount"]))
+        inner = jks.jks.javaobj.loads(plaintext)
+        self.assertEqual(inner.get_class().name, "javax.crypto.spec.SecretKeySpec")
+        self.assertEqual(inner.get_class().serialVersionUID, 6577238317307289933)
+        self.assertEqual(str(inner.algorithm), "AES")
+        self.assertEqual(jks.KeyStore._java_bytestring(inner.key), key_bytes)
+
+        # the trailing SHA-1 digest covers exactly the bytes preceding it
+        digest = store_bytes[pos:]
+        self.assertEqual(len(digest), 20)
+        self.assertEqual(digest, hashlib.sha1(store_password.encode("utf-16be")
+                                             + jks.jks.SIGNATURE_WHITENING
+                                             + store_bytes[:pos]).digest())
+
+        # a wrong password must fail the integrity check
+        self.assertRaises(jks.util.KeystoreSignatureException,
+                          jks.KeyStore.loads, store_bytes, "wrong_password")
+
+    def test_save_jceks_secret_key_inner_encoding(self):
+        """SunJCE's specialized DES/DESede key classes serialize as KeyRep with a RAW secret encoding."""
+        import javaobj
+        from pyasn1.codec.ber import decoder
+        from jks import rfc2898, sun_crypto
+
+        des_key = b"\x4c\xf2\xfe\x91\x5d\x08\x2a\x43"
+        desede_key = b"\x67\x5e\x52\x45\xe9\x67\x3b\x4c\x8f\xc1\x94\xce\xec\x43\x3b\x31\x8c\x45\xc2\xe0\x67\x5e\x52\x45"
+        store_password = "12345678"
+        store = jks.KeyStore.new("jceks", [
+            jks.SecretKeyEntry.new("des", "DES", des_key),
+            jks.SecretKeyEntry.new("desede", "DESede", desede_key),
+        ])
+        store_bytes = store.saves(store_password)
+
+        pos = 12
+        for expected_alias, expected_algorithm, expected_key in [
+                ("des", "DES", des_key), ("desede", "DESede", desede_key)]:
+            self.assertEqual(struct.unpack_from(">L", store_bytes, pos)[0], 3); pos += 4
+            alias_len = struct.unpack_from(">H", store_bytes, pos)[0]; pos += 2
+            self.assertEqual(store_bytes[pos:pos + alias_len], expected_alias.encode("ascii")); pos += alias_len
+            pos += 8 # timestamp
+
+            stream = jks.jks.BytesIO(store_bytes[pos:])
+            sealed = javaobj.load(stream, ignore_remaining_data=True)
+            pos += stream.tell()
+            self.assertEqual(sealed.get_class().name,
+                             "com.sun.crypto.provider.SealedObjectForKeyProtector")
+
+            params = decoder.decode(jks.KeyStore._java_bytestring(sealed.encodedParams),
+                                    asn1Spec=rfc2898.PBEParameter())[0]
+            plaintext = sun_crypto.jce_pbe_decrypt(
+                jks.KeyStore._java_bytestring(sealed.encryptedContent), store_password,
+                params["salt"].asOctets(), int(params["iterationCount"]))
+
+            inner = javaobj.loads(plaintext)
+            self.assertEqual(inner.get_class().name, "java.security.KeyRep")
+            self.assertEqual(str(inner.algorithm), expected_algorithm)
+            self.assertEqual(str(inner.format), "RAW")
+            self.assertEqual(inner.type.constant, "SECRET")
+            self.assertEqual(jks.KeyStore._java_bytestring(inner.encoded), expected_key)
+
+        self.assertEqual(pos, len(store_bytes) - 20)
 
 class JceOnlyTests(AbstractTest):
     def test_des_secret_key(self):

@@ -85,6 +85,18 @@ Entry types
     :member-order: bysource
     :inherited-members:
 
+    Secret keys are stored as Java ``SealedObject`` instances, sealed with
+    the (unpublished) ``PBEWithMD5AndTripleDES`` algorithm. The inner
+    serialized object is either a ``javax.crypto.spec.SecretKeySpec`` or,
+    for SunJCE's specialized DES/3DES key classes, a
+    ``java.security.KeyRep`` with a ``RAW`` secret encoding.
+
+    New entries can be created with :meth:`SecretKeyEntry.new`, which
+    returns an entry in decrypted form; it is sealed with the store password
+    on save. Call :meth:`encrypt` to give a secret key a password of its own.
+    Saving never modifies entries: already-sealed keys are written back with
+    their existing SealedObject bytes.
+
     .. attribute:: algorithm
 
         .. note:: Only accessible after a call to :func:`decrypt`; until then, accessing this attribute will raise

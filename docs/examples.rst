@@ -104,3 +104,28 @@ Generating a basic self signed certificate with OpenSSL and saving it in a jks k
 	# creating a jks keystore with the private key, and saving it
 	keystore = jks.KeyStore.new('jks', [pke])
 	keystore.save('./my_keystore.jks', 'my_password')
+
+Reading a JCEKS keystore, updating it, and saving it back::
+
+  import jks
+
+  keystore = jks.KeyStore.load('./my_keystore.jceks', 'my_password')
+
+  # entries that are already encrypted stay encrypted exactly as they were;
+  # nothing is re-encrypted with the store password on save
+  keystore.save('./copy.jceks', 'my_password')
+
+  # adding a new secret key: it is sealed with the store password on save
+  secret_key = jks.SecretKeyEntry.new('my_secret_key', 'AES',
+                                      b'\x00' * 16)
+  keystore.entries[secret_key.alias] = secret_key
+  keystore.store_type = 'jceks'
+  keystore.save('./with_secret_key.jceks', 'my_password')
+
+  # to protect a secret key with a password of its own, seal it beforehand
+  secret_key.encrypt('my_secret_key_password')
+  keystore.save('./custom_password.jceks', 'my_password')
+
+JCEKS keystores can contain trusted certificates, private keys and secret
+keys side by side. Secret keys are stored as Java ``SealedObject`` instances,
+just as the JDK does.

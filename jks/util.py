@@ -94,11 +94,13 @@ class AbstractKeystore(object):
 
     def save(self, filename, store_password):
         """
-        Convenience wrapper function; calls the :func:`saves` 
+        Convenience wrapper function; calls the :func:`saves`
         and saves the content to a file.
         """
+        # Serialize first, so that a failure while building the output
+        # does not truncate or overwrite an existing file.
+        keystore_bytes = self.saves(store_password)
         with open(filename, 'wb') as file:
-            keystore_bytes = self.saves(store_password)
             file.write(keystore_bytes)
 
     @classmethod
