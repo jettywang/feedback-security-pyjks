@@ -10,13 +10,20 @@ import os
 import sys
 import unittest
 import hashlib
+from unittest import mock
 
 import jks
 from jks.util import py23basestring
+from jks import rfc2898
+from pyasn1.codec.ber import encoder
+from pyasn1.type import univ
+from pyasn1_modules import rfc5208
 from . import expected
 
 CUR_PATH = os.path.dirname(os.path.abspath(__file__))
 KS_PATH = os.path.join(CUR_PATH, 'keystores')
+
+expected_aes128_key = b"\x66\x6e\x02\x21\xcc\x44\xc1\xfc\x4a\xab\xf4\x58\xf9\xdf\xdd\x3c"
 
 try:
     long
@@ -789,6 +796,222 @@ class MiscTests(AbstractTest):
         pk = self.find_private_key(store, "mykey")
         self.check_pkey_and_certs_equal(pk, jks.util.RSA_ENCRYPTION_OID, expected.RSA1024.private_key, expected.RSA1024.certs)
         dummy = pk.cert_chain
+
+
+class DecryptionValidationTests(AbstractTest):
+    """
+    Regression tests for post-decryption plaintext validation.
+
+    A successful password check is not sufficient to mark an entry decrypted;
+    the plaintext must be a complete, single, algorithm-consistent key object.
+    Failures must preserve the encrypted material so a later correct password
+    can still succeed.
+    """
+
+    def _decrypted_private_plaintext(self, path, password="12345678"):
+        store = jks.KeyStore.load(path, password, try_decrypt_keys=False)
+        entry = store.entries["mykey"]
+        encrypted_info = jks.util.der_decode_exact(entry._encrypted, rfc5208.EncryptedPrivateKeyInfo())
+        algorithm = encrypted_info["encryptionAlgorithm"]["algorithm"].asTuple()
+        encrypted_data = encrypted_info["encryptedData"].asOctets()
+        if algorithm == jks.sun_crypto.SUN_JKS_ALGO_ID:
+            return entry, jks.sun_crypto.jks_pkey_decrypt(encrypted_data, password)
+        params = jks.util.der_decode_exact(encrypted_info["encryptionAlgorithm"]["parameters"].asOctets(), rfc2898.PBEParameter())
+        return entry, jks.sun_crypto.jce_pbe_decrypt(encrypted_data, password, params["salt"].asOctets(), int(params["iterationCount"]))
+
+    def _decrypted_secret_plaintext(self, path, password="12345678"):
+        store = jks.KeyStore.load(path, password, try_decrypt_keys=False)
+        entry = store.entries["mykey"]
+        sealed_obj = entry._encrypted
+        params = jks.util.der_decode_exact(sealed_obj.encodedParams, rfc2898.PBEParameter())
+        plaintext = jks.sun_crypto.jce_pbe_decrypt(sealed_obj.encryptedContent, password, params["salt"].asOctets(), int(params["iterationCount"]))
+        return entry, plaintext
+
+    def _sealed_bks_plaintext(self, path, alias, password="12345678"):
+        store = jks.bks.BksKeyStore.load(path, password, try_decrypt_keys=False)
+        entry = store.entries[alias]
+        data = entry._encrypted
+        salt, pos = jks.bks.BksKeyStore._read_data(data, 0)
+        iteration_count = jks.util.b4.unpack_from(data, pos)[0]; pos += 4
+        plaintext = jks.rfc7292.decrypt_PBEWithSHAAnd3KeyTripleDESCBC(data[pos:], password, salt, iteration_count)
+        return entry, plaintext
+
+    def assert_entry_untouched(self, entry, encrypted_before):
+        self.assertFalse(entry.is_decrypted())
+        self.assertTrue(entry._encrypted is encrypted_before)
+        self.assertRaises(jks.NotYetDecryptedException, lambda: entry.algorithm)
+
+    def test_private_key_trailing_garbage_is_rejected_and_retry_works(self):
+        entry, plaintext = self._decrypted_private_plaintext(KS_PATH + "/jks/RSA1024.jks")
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.sun_crypto.jks_pkey_decrypt", return_value=plaintext + b"garbage"):
+            self.assertRaises(jks.BadKeystoreFormatException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+        entry.decrypt("12345678")
+        self.assertTrue(entry.is_decrypted())
+        self.assertEqual(entry.pkey_pkcs8, expected.RSA1024.private_key)
+        self.assertEqual(entry.algorithm_oid, jks.util.RSA_ENCRYPTION_OID)
+
+        entry.decrypt("12345678")
+        self.assertEqual(entry.pkey_pkcs8, expected.RSA1024.private_key)
+
+    def test_private_key_truncated_plaintext_is_rejected_and_retry_works(self):
+        entry, plaintext = self._decrypted_private_plaintext(KS_PATH + "/jks/RSA1024.jks")
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.sun_crypto.jks_pkey_decrypt", return_value=plaintext[:-10]):
+            self.assertRaises(jks.BadKeystoreFormatException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+        entry.decrypt("12345678")
+        self.assertEqual(entry.pkey_pkcs8, expected.RSA1024.private_key)
+
+    def test_private_key_concatenated_second_object_is_rejected(self):
+        entry, plaintext = self._decrypted_private_plaintext(KS_PATH + "/jks/RSA1024.jks")
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.sun_crypto.jks_pkey_decrypt", return_value=plaintext + plaintext):
+            self.assertRaises(jks.BadKeystoreFormatException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+    def test_private_key_algorithm_conflict_is_rejected_and_retry_works(self):
+        rsa_entry, rsa_plaintext = self._decrypted_private_plaintext(KS_PATH + "/jks/RSA1024.jks")
+        dsa_entry, dsa_plaintext = self._decrypted_private_plaintext(KS_PATH + "/jks/DSA2048.jks")
+        encrypted_before = rsa_entry._encrypted
+
+        # Structurally valid PKCS#8 for a DSA key, but the entry's certificate
+        # chain and key slot claim RSA.
+        with mock.patch("jks.sun_crypto.jks_pkey_decrypt", return_value=dsa_plaintext):
+            self.assertRaises(jks.UnexpectedAlgorithmException, rsa_entry.decrypt, "12345678")
+        self.assert_entry_untouched(rsa_entry, encrypted_before)
+
+        rsa_entry.decrypt("12345678")
+        self.assertEqual(rsa_entry.algorithm_oid, jks.util.RSA_ENCRYPTION_OID)
+        self.assertEqual(rsa_entry.pkey_pkcs8, expected.RSA1024.private_key)
+
+    def test_private_key_wrong_password_remains_decryption_failure(self):
+        entry, _ = self._decrypted_private_plaintext(KS_PATH + "/jks/RSA1024.jks")
+        encrypted_before = entry._encrypted
+        self.assertRaises(jks.DecryptionFailureException, entry.decrypt, "wrong_password")
+        self.assert_entry_untouched(entry, encrypted_before)
+        entry.decrypt("12345678")
+        self.assertEqual(entry.pkey_pkcs8, expected.RSA1024.private_key)
+
+    def test_private_key_unsupported_algorithm_is_classified(self):
+        entry, plaintext = self._decrypted_private_plaintext(KS_PATH + "/jks/RSA1024.jks")
+        info = jks.util.der_decode_exact(plaintext, rfc5208.PrivateKeyInfo())
+        info["privateKeyAlgorithm"]["algorithm"] = univ.ObjectIdentifier((1, 3, 6, 1, 4, 1, 99999, 1))
+        mutated = encoder.encode(info)
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.sun_crypto.jks_pkey_decrypt", return_value=mutated):
+            self.assertRaises(jks.UnexpectedAlgorithmException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+    def test_secret_key_trailing_garbage_is_rejected_and_retry_works(self):
+        entry, plaintext = self._decrypted_secret_plaintext(KS_PATH + "/jceks/AES128.jceks")
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.sun_crypto.jce_pbe_decrypt", return_value=plaintext + b"garbage"):
+            self.assertRaises(jks.BadKeystoreFormatException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+        self.assertTrue(entry._encrypted is encrypted_before)
+
+        entry.decrypt("12345678")
+        self.assertEqual(entry.key, expected_aes128_key)
+        self.assertEqual(entry.algorithm, "AES")
+        self.assertEqual(entry.key_size, 128)
+
+        entry.decrypt("12345678")
+        self.assertEqual(entry.key, expected_aes128_key)
+        self.assertEqual(entry.key_size, 128)
+
+    def test_secret_key_truncation_inside_java_array_is_rejected(self):
+        # javaobj normally returns a shortened byte array when the array
+        # length field says 16 but fewer bytes remain. This must be a format
+        # error, not a valid shorter key.
+        entry, plaintext = self._decrypted_secret_plaintext(KS_PATH + "/jceks/AES128.jceks")
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.sun_crypto.jce_pbe_decrypt", return_value=plaintext[:-1]):
+            self.assertRaises(jks.BadKeystoreFormatException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+        entry.decrypt("12345678")
+        self.assertEqual(len(entry.key), 16)
+        self.assertEqual(entry.key, expected_aes128_key)
+
+    def test_secret_key_concatenated_second_object_is_rejected(self):
+        entry, plaintext = self._decrypted_secret_plaintext(KS_PATH + "/jceks/AES128.jceks")
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.sun_crypto.jce_pbe_decrypt", return_value=plaintext + plaintext):
+            self.assertRaises(jks.BadKeystoreFormatException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+    def test_bks_sealed_trailing_garbage_is_rejected_and_retry_works(self):
+        entry, plaintext = self._sealed_bks_plaintext(KS_PATH + "/bks/christmas.bksv2", "sealed_private_key")
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.rfc7292.decrypt_PBEWithSHAAnd3KeyTripleDESCBC", return_value=plaintext + b"garbage"):
+            self.assertRaises(jks.BadKeystoreFormatException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+        self.assertTrue(entry._encrypted is encrypted_before)
+        self.assertTrue(entry.__dict__["_nested"] is None)
+
+        entry.decrypt("12345678")
+        self.assertEqual(entry.pkey_pkcs8, expected.bks_christmas.private_key)
+        self.assertEqual(entry.type, jks.bks.KEY_TYPE_PRIVATE)
+        entry.decrypt("12345678")
+        self.assertEqual(entry.pkey_pkcs8, expected.bks_christmas.private_key)
+
+    def test_bks_sealed_truncated_plaintext_is_rejected_and_retry_works(self):
+        entry, plaintext = self._sealed_bks_plaintext(KS_PATH + "/bks/christmas.bksv2", "sealed_private_key")
+        encrypted_before = entry._encrypted
+        with mock.patch("jks.rfc7292.decrypt_PBEWithSHAAnd3KeyTripleDESCBC", return_value=plaintext[:-10]):
+            self.assertRaises(jks.BadKeystoreFormatException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+        entry.decrypt("12345678")
+        self.assertEqual(entry.pkey_pkcs8, expected.bks_christmas.private_key)
+
+    def test_bks_sealed_algorithm_conflict_is_rejected(self):
+        entry, plaintext = self._sealed_bks_plaintext(KS_PATH + "/bks/christmas.bksv2", "sealed_private_key")
+        # Rewrite the BKS key entry's declared algorithm to DSA while leaving
+        # a valid RSA PKCS#8 key and its DER length intact.
+        pos = 1  # key type byte
+        format_len = jks.util.b2.unpack_from(plaintext, pos)[0]
+        pos += 2 + format_len
+        algorithm_len = jks.util.b2.unpack_from(plaintext, pos)[0]
+        algorithm_field_pos = pos
+        self.assertEqual(plaintext[pos+2:pos+2+algorithm_len], b"RSA")
+        mutated = bytearray(plaintext)
+        mutated[algorithm_field_pos+2:algorithm_field_pos+2+algorithm_len] = b"DSA"[:algorithm_len]
+        encrypted_before = entry._encrypted
+
+        with mock.patch("jks.rfc7292.decrypt_PBEWithSHAAnd3KeyTripleDESCBC", return_value=bytes(mutated)):
+            self.assertRaises(jks.UnexpectedAlgorithmException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+        entry.decrypt("12345678")
+        self.assertEqual(entry.pkey_pkcs8, expected.bks_christmas.private_key)
+
+    def test_bks_sealed_unsupported_encoding_is_classified(self):
+        entry, plaintext = self._sealed_bks_plaintext(KS_PATH + "/bks/christmas.bksv2", "sealed_private_key")
+        mutated = bytearray(plaintext)
+        # The format field starts after the one-byte key type; rewrite
+        # "PKCS#8" to a same-length unsupported value.
+        format_len = jks.util.b2.unpack_from(mutated, 1)[0]
+        self.assertEqual(mutated[3:3+format_len], b"PKCS#8")
+        mutated[3:3+format_len] = b"BADENC"[:format_len]
+        encrypted_before = entry._encrypted
+
+        with mock.patch("jks.rfc7292.decrypt_PBEWithSHAAnd3KeyTripleDESCBC", return_value=bytes(mutated)):
+            self.assertRaises(jks.UnexpectedKeyEncodingException, entry.decrypt, "12345678")
+        self.assert_entry_untouched(entry, encrypted_before)
+
+    def test_bks_sealed_wrong_password_remains_decryption_failure(self):
+        entry, _ = self._sealed_bks_plaintext(KS_PATH + "/bks/christmas.bksv2", "sealed_private_key")
+        encrypted_before = entry._encrypted
+        self.assertRaises(jks.DecryptionFailureException, entry.decrypt, "wrong_password")
+        self.assert_entry_untouched(entry, encrypted_before)
+        entry.decrypt("12345678")
+        self.assertEqual(entry.pkey_pkcs8, expected.bks_christmas.private_key)
+
 
 if __name__ == "__main__":
     unittest.main()

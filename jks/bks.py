@@ -1,8 +1,6 @@
 # vim: set et ai ts=4 sts=4 sw=4:
 import struct
 import hashlib
-from pyasn1.codec.ber import decoder
-from pyasn1_modules import rfc5208, rfc2459
 from Cryptodome.Hash import HMAC, SHA
 
 from .util import *
@@ -51,24 +49,32 @@ class BksKeyEntry(AbstractBksEntry):
             if self.format not in ["PKCS8", "PKCS#8"]:
                 raise UnexpectedKeyEncodingException("Unexpected encoding for private key entry: '%s'" % self.format)
             # self.encoded is a PKCS#8 PrivateKeyInfo
-            private_key_info = decoder.decode(self.encoded, asn1Spec=rfc5208.PrivateKeyInfo())[0]
+            private_key_info, algorithm_oid, pkey = decode_pkcs8_private_key_info(self.encoded)
+            declared_family = normalize_public_key_algorithm(algorithm)
+            if declared_family is not None and public_key_algorithm_family(algorithm_oid) != declared_family:
+                raise UnexpectedAlgorithmException("Private key algorithm OID %s does not match declared BKS algorithm '%s'" % (algorithm_oid, algorithm))
             self.pkey_pkcs8 = self.encoded
-            self.pkey = private_key_info['privateKey'].asOctets()
-            self.algorithm_oid = private_key_info['privateKeyAlgorithm']['algorithm'].asTuple()
+            self.pkey = pkey
+            self.algorithm_oid = algorithm_oid
 
         elif self.type == KEY_TYPE_PUBLIC:
             if self.format not in ["X.509", "X509"]:
                 raise UnexpectedKeyEncodingException("Unexpected encoding for public key entry: '%s'" % self.format)
             # self.encoded is an X.509 SubjectPublicKeyInfo
-            spki = decoder.decode(self.encoded, asn1Spec=rfc2459.SubjectPublicKeyInfo())[0]
+            spki, algorithm_oid, public_key = validate_public_key_encoding(None, self.encoded)
+            declared_family = normalize_public_key_algorithm(algorithm)
+            if declared_family is not None and public_key_algorithm_family(algorithm_oid) != declared_family:
+                raise UnexpectedAlgorithmException("Public key algorithm OID %s does not match declared BKS algorithm '%s'" % (algorithm_oid, algorithm))
             self.public_key_info = self.encoded
-            self.public_key = bitstring_to_bytes(spki['subjectPublicKey'])
-            self.algorithm_oid = spki['algorithm']['algorithm'].asTuple()
+            self.public_key = public_key
+            self.algorithm_oid = algorithm_oid
 
         elif self.type == KEY_TYPE_SECRET:
             if self.format != "RAW":
                 raise UnexpectedKeyEncodingException("Unexpected encoding for raw key entry: '%s'" % self.format)
             # self.encoded is an unwrapped/raw cryptographic key
+            if not encoded:
+                raise UnexpectedKeyEncodingException("Unexpected empty raw key entry")
             self.key = encoded
             self.key_size = len(encoded)*8
 
@@ -164,9 +170,16 @@ class BksSealedKeyEntry(AbstractBksEntry):
         pos = 0
         data = self._encrypted
 
-        salt, pos = BksKeyStore._read_data(data, pos)
-        iteration_count = b4.unpack_from(data, pos)[0]; pos += 4
+        try:
+            salt, pos = BksKeyStore._read_data(data, pos)
+            iteration_count = b4.unpack_from(data, pos)[0]; pos += 4
+        except struct.error as e:
+            raise BadKeystoreFormatException("Bad BKS entry format: %s" % str(e))
+        if pos > len(data):
+            raise BadKeystoreFormatException("Bad BKS entry format: truncated sealed entry parameters")
         encrypted_blob = data[pos:]
+        if not salt:
+            raise BadKeystoreFormatException("Bad BKS entry format: empty salt in sealed entry")
 
         # The intention of the BKS entry decryption routine in BcKeyStoreSpi.StoreEntry.getObject(char[] password) appears to be:
         #  - try to decrypt with "PBEWithSHAAnd3-KeyTripleDES-CBC" first (1.2.840.113549.1.12.1.3);
@@ -191,12 +204,23 @@ class BksSealedKeyEntry(AbstractBksEntry):
         try:
             decrypted = rfc7292.decrypt_PBEWithSHAAnd3KeyTripleDESCBC(encrypted_blob, key_password, salt, iteration_count)
         except BadDataLengthException:
-            raise BadKeystoreFormatException("Bad BKS entry format: %s" % str(e))
+            raise BadKeystoreFormatException("Bad BKS entry format: encrypted data length is not a multiple of 8 bytes")
         except BadPaddingException:
             raise DecryptionFailureException("Failed to decrypt data for key '%s'; wrong password?" % self.alias)
 
-        # the plaintext content of a SealedEntry is a KeyEntry
-        key_entry, dummy = BksKeyStore._read_bks_key(decrypted, 0, self.store_type)
+        # The plaintext content of a SealedEntry is exactly one KeyEntry.
+        # Parse and validate that entry, including its key material, before
+        # mutating any state. Any truncation, trailing bytes, unsupported
+        # encoding or malformed PKCS#8 leaves the encrypted entry untouched.
+        try:
+            key_entry, pos = BksKeyStore._read_bks_key(decrypted, 0, self.store_type)
+        except struct.error as e:
+            raise BadKeystoreFormatException("Bad BKS entry format: %s" % str(e))
+        if pos > len(decrypted):
+            raise BadKeystoreFormatException("Bad BKS entry format: truncated sealed key entry")
+        if pos != len(decrypted):
+            raise BadKeystoreFormatException("Bad BKS entry format: found %d trailing byte(s) after the sealed key entry" % (len(decrypted) - pos))
+
         key_entry.store_type = self.store_type
         key_entry.cert_chain = self.cert_chain
         key_entry.alias = self.alias

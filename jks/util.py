@@ -4,6 +4,11 @@ import textwrap
 import base64
 import struct
 
+from pyasn1.codec.ber import decoder
+from pyasn1.error import PyAsn1Error, SubstrateUnderrunError
+from pyasn1.type import univ
+from pyasn1_modules import rfc5208, rfc3447, rfc5915, rfc2459
+
 b8 = struct.Struct('>Q')
 b4 = struct.Struct('>L') # unsigned
 b2 = struct.Struct('>H')
@@ -14,6 +19,13 @@ py23basestring = ("".__class__, u"".__class__) # useful for isinstance checks
 RSA_ENCRYPTION_OID = (1,2,840,113549,1,1,1)
 DSA_OID            = (1,2,840,10040,4,1)       # identifier for DSA public/private keys; see RFC 3279, section 2.2.2 (e.g. in PKCS#8 PrivateKeyInfo or X.509 SubjectPublicKeyInfo)
 DSA_WITH_SHA1_OID  = (1,2,840,10040,4,3)       # identifier for the DSA signature algorithm; see RFC 3279, section 2.3.2 (e.g. in X.509 signatures)
+RSA_PSS_OID        = (1,2,840,113549,1,1,10)
+EC_PUBLIC_KEY_OID  = (1,2,840,10045,2,1)
+DH_OID             = (1,2,840,113549,1,3,1)
+ED25519_OID        = (1,3,101,112)
+ED448_OID          = (1,3,101,113)
+X25519_OID         = (1,3,101,110)
+X448_OID           = (1,3,101,111)
 
 class KeystoreException(Exception):
     """Superclass for all pyjks exceptions."""
@@ -71,6 +83,208 @@ class UnsupportedKeyFormatException(KeystoreException):
     """Signifies that the key format was an unsupported type."""
     pass
 
+
+def der_decode_exact(data, asn1Spec=None):
+    """
+    Decodes exactly one DER value and rejects both malformed input and any
+    trailing bytes after the first encoded value.
+
+    This is intentionally stricter than pyasn1's decoder defaults: trusting
+    an outer checksum or a successful prefix parse must not make a value
+    usable when the remaining bytes hold another object or arbitrary data.
+
+    :raises BadKeystoreFormatException: If the data is truncated, malformed,
+      or contains trailing bytes after a complete object.
+    """
+    try:
+        value, rest_of_data = decoder.decode(data, asn1Spec=asn1Spec)
+    except PyAsn1Error as e:
+        error = BadKeystoreFormatException("Malformed DER data: %s" % str(e))
+        error.__cause__ = e
+        raise error
+
+    if rest_of_data:
+        raise BadKeystoreFormatException("Malformed DER data: found %d trailing byte(s) after a complete object" % len(rest_of_data))
+    return value
+
+
+def decode_pkcs8_private_key_info(data):
+    """
+    Parse a PKCS#8 PrivateKeyInfo and verify that its required members were
+    actually present in the encoding, not just schema placeholders.
+
+    :raises BadKeystoreFormatException: If the structure is truncated or
+      otherwise incomplete.
+    """
+    private_key_info = der_decode_exact(data, rfc5208.PrivateKeyInfo())
+
+    try:
+        version = int(private_key_info['version'])
+    except (PyAsn1Error, TypeError, ValueError):
+        raise BadKeystoreFormatException("Malformed PKCS#8 private key: missing or invalid version")
+    if version not in (0, 1):
+        raise BadKeystoreFormatException("Malformed PKCS#8 private key: unsupported version %r" % version)
+
+    try:
+        algorithm = private_key_info['privateKeyAlgorithm']['algorithm'].asTuple()
+        encoded_key = private_key_info['privateKey'].asOctets()
+    except (PyAsn1Error, TypeError, ValueError):
+        raise BadKeystoreFormatException("Malformed PKCS#8 private key: missing algorithm or key material")
+
+    if not algorithm:
+        raise BadKeystoreFormatException("Malformed PKCS#8 private key: empty algorithm identifier")
+    if not private_key_info['privateKeyAlgorithm']['algorithm'].isValue or not private_key_info['privateKey'].isValue:
+        raise BadKeystoreFormatException("Malformed PKCS#8 private key: incomplete algorithm or key material")
+    if not encoded_key:
+        raise BadKeystoreFormatException("Malformed PKCS#8 private key: empty private key material")
+
+    validate_private_key_encoding(algorithm, encoded_key)
+
+    return private_key_info, algorithm, encoded_key
+
+
+def validate_private_key_encoding(algorithm_oid, encoded_key):
+    """
+    Verify that the private key bytes inside a PKCS#8 PrivateKeyInfo match
+    the algorithm identifier and are completely consumable.
+
+    For algorithms with a defined private-key DER structure this checks the
+    inner structure using an algorithm-specific ASN.1 schema; unsupported
+    algorithm identifiers are rejected rather than treated as usable keys.
+
+    :raises UnexpectedAlgorithmException: If the algorithm is unsupported.
+    :raises UnexpectedKeyEncodingException: If the inner key encoding does
+      not match the algorithm.
+    :raises BadKeystoreFormatException: If the inner key data is malformed
+      or followed by trailing bytes.
+    """
+    if algorithm_oid in (RSA_ENCRYPTION_OID, RSA_PSS_OID):
+        # PKCS#1 RSAPrivateKey. A PSS key carries the same RSAPrivateKey
+        # structure in PKCS#8.
+        _check_der_key_structure(encoded_key, rfc3447.RSAPrivateKey(), "RSA")
+        return
+
+    if algorithm_oid == DSA_OID:
+        # PKCS#8 stores DSA private keys as an ASN.1 INTEGER (x).
+        _check_der_key_structure(encoded_key, univ.Integer(), "DSA")
+        return
+
+    if algorithm_oid == EC_PUBLIC_KEY_OID:
+        _check_der_key_structure(encoded_key, rfc5915.ECPrivateKey(), "EC")
+        return
+
+    if algorithm_oid in (ED25519_OID, ED448_OID, X25519_OID, X448_OID):
+        # RFC 8410 stores the raw private key as an OCTET STRING payload;
+        # the PKCS#8 layer already gives us those octets, so require the
+        # usual sizes and no inner DER object.
+        expected_sizes = {ED25519_OID: 32, ED448_OID: 57, X25519_OID: 32, X448_OID: 56}
+        if len(encoded_key) != expected_sizes[algorithm_oid]:
+            raise BadKeystoreFormatException("Malformed private key: expected %d bytes for algorithm OID %s, found %d" % \
+                                             (expected_sizes[algorithm_oid], algorithm_oid, len(encoded_key)))
+        return
+
+    if algorithm_oid == DH_OID:
+        raise UnexpectedKeyEncodingException("DH private key encoding is not supported")
+
+    raise UnexpectedAlgorithmException("Unsupported private key algorithm OID: %s" % (algorithm_oid,))
+
+
+def _check_der_key_structure(encoded_key, asn1Spec, algorithm_family):
+    """
+    Check that inner private key bytes are one complete DER object of the
+    expected algorithm-specific schema.
+
+    Truncation and trailing bytes are corruption (BadKeystoreFormatException).
+    A complete, differently-tagged object is an unsupported key encoding
+    (UnexpectedKeyEncodingException).
+    """
+    try:
+        value, rest_of_data = decoder.decode(encoded_key, asn1Spec=asn1Spec)
+    except SubstrateUnderrunError as e:
+        raise BadKeystoreFormatException("Malformed %s private key: truncated DER data (%s)" % (algorithm_family, str(e)))
+    except PyAsn1Error as e:
+        raise UnexpectedKeyEncodingException("Private key material is not a valid %s private key: %s" % (algorithm_family, str(e)))
+
+    if rest_of_data:
+        raise BadKeystoreFormatException("Malformed %s private key: found %d trailing byte(s) after a complete key object" % (algorithm_family, len(rest_of_data)))
+    return value
+
+
+def normalize_public_key_algorithm(algorithm_name):
+    """
+    Map a Java key algorithm name to its canonical family name.
+
+    Returns ``None`` when the name is unknown.
+    """
+    if not algorithm_name:
+        return None
+    normalized = str(algorithm_name).upper().replace("-", "").replace("_", "")
+    if normalized == "RSA" or normalized.startswith("RSASSA"):
+        return "RSA"
+    if normalized == "DSA":
+        return "DSA"
+    if normalized in ("EC", "ECDSA"):
+        return "EC"
+    if normalized in ("ED25519", "ED448", "EDDSA"):
+        return "EDDSA"
+    if normalized in ("X25519", "X448", "XDH"):
+        return "XDH"
+    if normalized in ("DH", "DIFFIEHELLMAN"):
+        return "DH"
+    if normalized == "AES":
+        return "AES"
+    if normalized in ("DES", "DESEDE", "TRIPLEDES", "3DES"):
+        return "DES"
+    return None
+
+
+def public_key_algorithm_family(algorithm_oid):
+    """Return the canonical key family for a public/private key OID."""
+    if algorithm_oid in (RSA_ENCRYPTION_OID, RSA_PSS_OID):
+        return "RSA"
+    if algorithm_oid == DSA_OID:
+        return "DSA"
+    if algorithm_oid == EC_PUBLIC_KEY_OID:
+        return "EC"
+    if algorithm_oid in (ED25519_OID, ED448_OID):
+        return "EDDSA"
+    if algorithm_oid in (X25519_OID, X448_OID):
+        return "XDH"
+    if algorithm_oid == DH_OID:
+        return "DH"
+    return None
+
+
+def validate_public_key_encoding(algorithm_oid, encoded_key):
+    """
+    Validate an X.509 SubjectPublicKeyInfo and ensure that the algorithm
+    identifier is present, supported and consistent with the certificate's
+    key material.
+
+    :raises BadKeystoreFormatException: If the SPKI structure is incomplete
+      or malformed.
+    :raises UnexpectedAlgorithmException: If the algorithm is unsupported.
+    :raises UnexpectedKeyEncodingException: If the key encoding does not
+      match the algorithm.
+    """
+    spki = der_decode_exact(encoded_key, rfc2459.SubjectPublicKeyInfo())
+    if not spki['algorithm']['algorithm'].isValue or not spki['subjectPublicKey'].isValue:
+        raise BadKeystoreFormatException("Malformed X.509 public key: incomplete SubjectPublicKeyInfo")
+
+    found_oid = spki['algorithm']['algorithm'].asTuple()
+    if not found_oid:
+        raise BadKeystoreFormatException("Malformed X.509 public key: empty algorithm identifier")
+    if algorithm_oid is not None and found_oid != algorithm_oid:
+        raise UnexpectedAlgorithmException("Public key algorithm OID %s does not match the entry's algorithm OID %s" % (found_oid, algorithm_oid))
+    if public_key_algorithm_family(found_oid) is None:
+        raise UnexpectedAlgorithmException("Unsupported public key algorithm OID: %s" % (found_oid,))
+
+    public_key = bitstring_to_bytes(spki['subjectPublicKey'])
+    if not public_key:
+        raise UnexpectedKeyEncodingException("Malformed X.509 public key: empty subject public key")
+
+    return spki, found_oid, public_key
+
 class AbstractKeystore(object):
     """
     Abstract superclass for keystores.
@@ -107,8 +321,13 @@ class AbstractKeystore(object):
         :param kind: Optional; a human-friendly identifier for the kind of UTF-8 data we're loading (e.g. is it a keystore alias? an algorithm identifier? something else?).
                      Used to construct more informative exception messages when a decoding error occurs.
         """
+        if pos < 0 or pos + 2 > len(data):
+            raise BadKeystoreFormatException("Unexpected end of data while reading %s length" % (kind or "data"))
         size = b2.unpack_from(data, pos)[0]
         pos += 2
+        if pos + size > len(data):
+            raise BadKeystoreFormatException("Unexpected end of data while reading %s; found %d bytes, expected %d" % \
+                                             (kind or "data", len(data) - pos, size))
         try:
             return data[pos:pos+size].decode('utf-8'), pos+size
         except (UnicodeEncodeError, UnicodeDecodeError) as e:
@@ -117,8 +336,13 @@ class AbstractKeystore(object):
 
     @classmethod
     def _read_data(cls, data, pos):
+        if pos < 0 or pos + 4 > len(data):
+            raise BadKeystoreFormatException("Unexpected end of data while reading data length")
         size = b4.unpack_from(data, pos)[0]
         pos += 4
+        if pos + size > len(data):
+            raise BadKeystoreFormatException("Unexpected end of data while reading data; found %d bytes, expected %d" % \
+                                             (len(data) - pos, size))
         return data[pos:pos+size], pos+size
 
     @classmethod

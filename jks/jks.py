@@ -32,7 +32,8 @@ import hashlib
 import javaobj
 import time
 from pyasn1.codec.ber import encoder, decoder
-from pyasn1_modules import rfc5208
+from pyasn1.error import PyAsn1Error
+from pyasn1_modules import rfc5208, rfc2459
 from pyasn1_modules.rfc2459 import AlgorithmIdentifier
 from pyasn1.type import univ, namedtype
 from . import rfc2898
@@ -44,12 +45,45 @@ try:
 except ImportError:
     from io import BytesIO  # python3
 
+
+class _ExactReadBytesIO(BytesIO):
+    """
+    In-memory stream that refuses to silently satisfy a short read.
+
+    javaobj uses ``stream.read(n)`` for byte arrays and does not verify the
+    returned length, so truncating the serialized stream would otherwise
+    yield a smaller array instead of an error.
+    """
+    def read(self, size=-1):
+        result = super(_ExactReadBytesIO, self).read(size)
+        if size is not None and size >= 0 and len(result) != size:
+            raise BadKeystoreFormatException("Malformed serialized Java object: stream ended unexpectedly (wanted %d bytes, found %d)" % (size, len(result)))
+        return result
+
 __version_info__ = (20, 0, 1, 'dev')
 __version__ = ".".join(str(x) for x in __version_info__ if str(x))
 
 MAGIC_NUMBER_JKS = b4.pack(0xFEEDFEED)
 MAGIC_NUMBER_JCEKS = b4.pack(0xCECECECE)
 SIGNATURE_WHITENING = b"Mighty Aphrodite"
+
+
+def certificate_public_key_algorithm(entry):
+    """
+    Return the normalized public-key family named by the first certificate in
+    an entry's chain, or ``None`` if no usable certificate is available.
+
+    The chain is unencrypted metadata and therefore provides an independent
+    consistency check for the decrypted private key.
+    """
+    for cert_type, cert_data in (entry.cert_chain or []):
+        try:
+            certificate = der_decode_exact(cert_data, rfc2459.Certificate())
+            algorithm_oid = certificate['tbsCertificate']['subjectPublicKeyInfo']['algorithm']['algorithm'].asTuple()
+        except (BadKeystoreFormatException, PyAsn1Error):
+            return None
+        return public_key_algorithm_family(algorithm_oid)
+    return None
 
 
 class TrustedCertEntry(AbstractKeystoreEntry):
@@ -145,10 +179,10 @@ class PrivateKeyEntry(AbstractKeystoreEntry):
                                cert_chain = cert_chain)
 
         if key_format == 'pkcs8':
-            private_key_info = decoder.decode(key, asn1Spec=rfc5208.PrivateKeyInfo())[0]
+            private_key_info, algorithm_oid, inner_key = decode_pkcs8_private_key_info(key)
 
-            pke._algorithm_oid = private_key_info['privateKeyAlgorithm']['algorithm'].asTuple()
-            pke.pkey = private_key_info['privateKey'].asOctets()
+            pke._algorithm_oid = algorithm_oid
+            pke.pkey = inner_key
             pke.pkey_pkcs8 = key
 
         elif key_format == 'rsa_raw':
@@ -192,12 +226,17 @@ class PrivateKeyEntry(AbstractKeystoreEntry):
         if self.is_decrypted():
             return
 
-        encrypted_info = decoder.decode(self._encrypted, asn1Spec=rfc5208.EncryptedPrivateKeyInfo())[0]
+        # Parse and validate the whole encrypted container before decrypting,
+        # so that malformed outer data is never presented as a password error.
+        encrypted_info = der_decode_exact(self._encrypted, rfc5208.EncryptedPrivateKeyInfo())
+        if not encrypted_info['encryptionAlgorithm']['algorithm'].isValue or \
+           not encrypted_info['encryptedData'].isValue:
+            raise BadKeystoreFormatException("Malformed encrypted private key: incomplete PKCS#8 EncryptedPrivateKeyInfo")
         algo_id = encrypted_info['encryptionAlgorithm']['algorithm'].asTuple()
-        algo_params = encrypted_info['encryptionAlgorithm']['parameters'].asOctets()
         encrypted_private_key = encrypted_info['encryptedData'].asOctets()
+        if not encrypted_private_key:
+            raise BadKeystoreFormatException("Malformed encrypted private key: empty encrypted data")
 
-        plaintext = None
         try:
             if algo_id == sun_crypto.SUN_JKS_ALGO_ID:
                 plaintext = sun_crypto.jks_pkey_decrypt(encrypted_private_key, key_password)
@@ -206,7 +245,9 @@ class PrivateKeyEntry(AbstractKeystoreEntry):
                 if self.store_type != "jceks":
                     raise UnexpectedAlgorithmException("Encountered JCEKS private key protection algorithm in JKS keystore")
                 # see RFC 2898, section A.3: PBES1 and definitions of AlgorithmIdentifier and PBEParameter
-                params = decoder.decode(algo_params, asn1Spec=rfc2898.PBEParameter())[0]
+                if not encrypted_info['encryptionAlgorithm']['parameters'].isValue:
+                    raise BadKeystoreFormatException("Malformed encrypted private key: missing PBE parameters")
+                params = der_decode_exact(encrypted_info['encryptionAlgorithm']['parameters'].asOctets(), rfc2898.PBEParameter())
                 salt = params['salt'].asOctets()
                 iteration_count = int(params['iterationCount'])
                 plaintext = sun_crypto.jce_pbe_decrypt(encrypted_private_key, key_password, salt, iteration_count)
@@ -215,11 +256,25 @@ class PrivateKeyEntry(AbstractKeystoreEntry):
 
         except (BadHashCheckException, BadPaddingException):
             raise DecryptionFailureException("Failed to decrypt data for private key '%s'; wrong password?" % self.alias)
+        except BadDataLengthException as e:
+            raise BadKeystoreFormatException("Malformed encrypted private key '%s': %s" % (self.alias, str(e)))
 
-        # at this point, 'plaintext' is a PKCS#8 PrivateKeyInfo (see RFC 5208)
-        private_key_info = decoder.decode(plaintext, asn1Spec=rfc5208.PrivateKeyInfo())[0]
-        key = private_key_info['privateKey'].asOctets()
-        algorithm_oid = private_key_info['privateKeyAlgorithm']['algorithm'].asTuple()
+        # at this point, 'plaintext' is a PKCS#8 PrivateKeyInfo (see RFC 5208).
+        # Validate it completely before touching any existing entry state.
+        private_key_info, algorithm_oid, key = decode_pkcs8_private_key_info(plaintext)
+
+        # An algorithm identifier that contradicts the key material's own
+        # algorithm is unusable as key material, even though the structure
+        # parsed. Do not expose it as a successfully decrypted key.
+        if self._algorithm_oid is not None and algorithm_oid != self._algorithm_oid:
+            raise UnexpectedAlgorithmException("Private key algorithm OID %s does not match the entry's algorithm OID %s" % (algorithm_oid, self._algorithm_oid))
+
+        # The certificate chain is available without decryption and names the
+        # public-key family. A private key of a different family cannot belong
+        # to this entry.
+        certificate_algorithm = certificate_public_key_algorithm(self)
+        if certificate_algorithm is not None and certificate_algorithm != public_key_algorithm_family(algorithm_oid):
+            raise UnexpectedAlgorithmException("Private key algorithm OID %s does not match the certificate chain's %s public key" % (algorithm_oid, certificate_algorithm))
 
         self._encrypted = None
         self._pkey = key
@@ -298,28 +353,31 @@ class SecretKeyEntry(AbstractKeystoreEntry):
         if self.is_decrypted():
             return
 
-        plaintext = None
         sealed_obj = self._encrypted
         #In python 2.7.x many issues have occured where comparison between 'JavaString' & 'str' have failed.
         #https://github.com/kurtbrose/pyjks/issues/60, https://github.com/kurtbrose/pyjks/issues/47
         #type cast sealed_obj.sealAlg which is of type <class 'javaobj.v1.beans.JavaString'> to <type 'str'>
         #So, that 'String' to 'String' comparison is performed and not 'JavaString' to 'String'
-        if str(sealed_obj.sealAlg) == "PBEWithMD5AndTripleDES":  
+        if str(sealed_obj.sealAlg) == "PBEWithMD5AndTripleDES":
             # if the object was sealed with PBEWithMD5AndTripleDES
             # then the parameters should apply to the same algorithm
             # and not be empty or null
-            if sealed_obj.paramsAlg != sealed_obj.sealAlg:
+            if str(sealed_obj.paramsAlg) != str(sealed_obj.sealAlg):
                 raise UnexpectedAlgorithmException("Unexpected parameters algorithm used in SealedObject; should match sealing algorithm '%s' but found '%s'" % (sealed_obj.sealAlg, sealed_obj.paramsAlg))
             if sealed_obj.encodedParams is None or len(sealed_obj.encodedParams) == 0:
                 raise UnexpectedJavaTypeException("No parameters found in SealedObject instance for sealing algorithm '%s'; need at least a salt and iteration count to decrypt" % sealed_obj.sealAlg)
 
-            params_asn1 = decoder.decode(sealed_obj.encodedParams, asn1Spec=rfc2898.PBEParameter())[0]
+            params_asn1 = der_decode_exact(sealed_obj.encodedParams, rfc2898.PBEParameter())
             salt = params_asn1['salt'].asOctets()
             iteration_count = int(params_asn1['iterationCount'])
+            if sealed_obj.encryptedContent is None or len(sealed_obj.encryptedContent) == 0:
+                raise BadKeystoreFormatException("Malformed SealedObject for secret key '%s': empty encrypted content" % self.alias)
             try:
                 plaintext = sun_crypto.jce_pbe_decrypt(sealed_obj.encryptedContent, key_password, salt, iteration_count)
-            except sun_crypto.BadPaddingException:
+            except BadPaddingException:
                 raise DecryptionFailureException("Failed to decrypt data for secret key '%s'; bad password?" % self.alias)
+            except BadDataLengthException as e:
+                raise BadKeystoreFormatException("Malformed SealedObject for secret key '%s': %s" % (self.alias, str(e)))
         else:
             raise UnexpectedAlgorithmException("Unexpected algorithm used for encrypting SealedObject: sealAlg=%s" % sealed_obj.sealAlg)
 
@@ -337,17 +395,47 @@ class SecretKeyEntry(AbstractKeystoreEntry):
         # object for a completely different one at serialization time.
         # Again for SunJCE, the subsitute object that gets serialized
         # is usually a java.security.KeyRep object.
-        obj, dummy = KeyStore._read_java_obj(plaintext, 0)
+        obj, stream = KeyStore._read_java_obj_exact(plaintext, 0)
         clazz = obj.get_class()
         if clazz.name == "javax.crypto.spec.SecretKeySpec":
-            algorithm = obj.algorithm
-            key = KeyStore._java_bytestring(obj.key)
+            try:
+                algorithm = obj.algorithm
+                key_bytes = obj.key
+            except AttributeError as e:
+                raise BadKeystoreFormatException("Malformed serialized javax.crypto.spec.SecretKeySpec object: %s" % str(e))
+            if algorithm is None:
+                raise UnexpectedKeyEncodingException("Serialized javax.crypto.spec.SecretKeySpec object for '%s' has no algorithm name" % self.alias)
+            try:
+                key_bytes = KeyStore._java_bytestring(key_bytes)
+            except (TypeError, ValueError, struct.error) as e:
+                raise BadKeystoreFormatException("Malformed key bytes in serialized javax.crypto.spec.SecretKeySpec object: %s" % str(e))
+            if not key_bytes:
+                raise UnexpectedKeyEncodingException("Unexpected empty key found in serialized javax.crypto.spec.SecretKeySpec object")
+            key = key_bytes
             key_size = len(key)*8
 
         elif clazz.name == "java.security.KeyRep":
-            assert (obj.type.constant == "SECRET"), "Expected value 'SECRET' for KeyRep.type enum value, found '%s'" % obj.type.constant
-            key_bytes = KeyStore._java_bytestring(obj.encoded)
-            key_encoding = obj.format
+            try:
+                key_type = obj.type
+                key_bytes = obj.encoded
+                key_encoding = obj.format
+                algorithm = obj.algorithm
+            except AttributeError as e:
+                raise BadKeystoreFormatException("Malformed serialized java.security.KeyRep object: %s" % str(e))
+
+            try:
+                key_type_constant = key_type.constant
+            except AttributeError:
+                raise BadKeystoreFormatException("Malformed serialized java.security.KeyRep object: missing key type")
+            if key_type_constant != "SECRET":
+                raise UnexpectedJavaTypeException("Expected value 'SECRET' for KeyRep.type enum value, found '%s'" % key_type_constant)
+            if algorithm is None:
+                raise UnexpectedKeyEncodingException("Serialized java.security.KeyRep object for '%s' has no algorithm name" % self.alias)
+            try:
+                key_bytes = KeyStore._java_bytestring(key_bytes)
+            except (TypeError, ValueError, struct.error) as e:
+                raise BadKeystoreFormatException("Malformed key bytes in serialized java.security.KeyRep object: %s" % str(e))
+
             if key_encoding == "RAW":
                 pass # ok, no further processing needed
             elif key_encoding == "X.509":
@@ -357,7 +445,8 @@ class SecretKeyEntry(AbstractKeystoreEntry):
             else:
                 raise UnexpectedKeyEncodingException("Unexpected key encoding '%s' found in serialized java.security.KeyRep object; expected one of 'RAW', 'X.509', 'PKCS#8'." % key_encoding)
 
-            algorithm = obj.algorithm
+            if not key_bytes:
+                raise UnexpectedKeyEncodingException("Unexpected empty key found in serialized java.security.KeyRep object")
             key = key_bytes
             key_size = len(key)*8
         else:
@@ -731,6 +820,43 @@ class KeyStore(AbstractKeystore):
         data_stream = BytesIO(data[pos:])
         obj = javaobj.load(data_stream, ignore_remaining_data=ignore_remaining_data)
         obj_size = data_stream.tell()
+
+        return obj, pos + obj_size
+
+    @classmethod
+    def _read_java_obj_exact(cls, data, pos):
+        """
+        Read exactly one serialized Java object from ``data[pos:]``.
+
+        Unlike :meth:`_read_java_obj`, this rejects trailing bytes after the
+        first object. Plaintext originating from a sealed object must contain
+        exactly one complete Java object; a valid object followed by more
+        data is ambiguous and must not be treated as usable key material.
+
+        The stream wrapper also makes short reads fatal. javaobj silently
+        returns a shortened byte array when the serialized length claims more
+        bytes than remain, which would otherwise turn a truncated sealed
+        object into a seemingly valid key.
+
+        :raises BadKeystoreFormatException: If the stream is not a raw Java
+          serialization stream, cannot be fully parsed, is truncated, or has
+          trailing data.
+        """
+        if data[pos:pos+2] != b"\xAC\xED":
+            raise BadKeystoreFormatException("Malformed serialized Java object: missing stream header")
+
+        data_stream = _ExactReadBytesIO(data[pos:])
+        try:
+            obj = javaobj.load(data_stream)
+        except BadKeystoreFormatException:
+            raise
+        except Exception as e:
+            raise BadKeystoreFormatException("Malformed serialized Java object: %s" % str(e))
+
+        obj_size = data_stream.tell()
+        if pos + obj_size != len(data):
+            raise BadKeystoreFormatException("Malformed serialized Java object: found %d trailing byte(s) after a complete object" % \
+                                             (len(data) - pos - obj_size))
 
         return obj, pos + obj_size
 
